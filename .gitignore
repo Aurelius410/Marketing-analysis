@@ -1,0 +1,57 @@
+# 注意：git 的 .gitignore 不支援行內註解，註解必須自成一行。
+
+# ── 個資與敏感資料（絕對不可推）──────────────────────────
+_pii_mapping.json
+
+# 客戶產業背景，逐案填寫，可能含商業機密
+**/domain_context.md
+
+# ── 原始資料與大檔 ───────────────────────────────────────
+# 課程原始檔、教授講義 PDF、他人作業檔。知識已萃取進 00_source_archive
+Google drive 資料/
+**/原始資料/
+**/01_raw/
+**/隔離區/
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.xlsx
+*.xls
+*.csv
+*.zip
+*.rar
+*.pdf
+*.docx
+*.pptx
+
+# ── 課程講義的逐頁重建（著作權保守處理，見 README）────────
+# 這兩份是課程投影片的近乎逐頁重建（57 頁含表格與問卷範本）。
+# 公開 repo 預設排除；要放回來把下面兩行刪掉即可。
+00_source_archive/local/大數據行銷IB5082/01_大數據時代之行銷戰略.md
+00_source_archive/local/大數據行銷IB5082/02_建構顧客關係行銷資料庫.md
+
+# ── 專案執行產物 ─────────────────────────────────────────
+projects/*/清理後資料/
+projects/*/分析資料表/
+projects/*/顧客特徵表/
+projects/*/模型輸出/
+projects/*/交付物/
+90_scratch/
+_log/*.jsonl
+
+# ── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+.venv-causal/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ── 作業系統與編輯器 ─────────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store
+~$*
+.vscode/
+.idea/
