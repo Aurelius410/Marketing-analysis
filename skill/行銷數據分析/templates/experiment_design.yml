@@ -1,0 +1,80 @@
+# 實驗設計書範本 —— M12 硬性產出
+# 用法：複製到 projects/<代號>/00_intake/experiment_design.yml，逐欄填滿。
+# 欄位的意義、每一欄缺了會怎樣，見 references/15_實驗設計.md §七 的規格表。
+# 空值符號沿用 00_通則與紀律.md §四：N/A = 有樣本算不出來；— = 無樣本。
+
+experiment_id: EXP-2026-03
+hypothesis: "我認為對群2沉睡高價值客發簡訊喚回券會提高30天內回購率，
+             因為他們的CAI<-10但M在前20%，若為真則資料上會看到
+             處理組30天回購率較對照組高≥2.5pp"        # 01 §3.3 三格句，第三格要帶方向/區間/門檻
+source_hypothesis_id: H1                              # 對回 00_intake/hypothesis_register.csv
+source_recommendation: "M11 建議 B"
+
+# ── 指標：主要指標只准一個 ──────────────────────────────
+primary_metric:
+  name: repurchase_rate_30d
+  metric_def_id: MD-0042            # dim_metric_definition，口徑單一真相（18-G10）
+  baseline: 0.032                   # 現況水準；比例型填 p，均值型填 mean
+  baseline_sd: N/A                  # 比例型不適用；均值型必填，且必須從自己的資料算
+guardrail_metrics:                  # 取自 metric_tree.yaml 的 guardrails
+  - {name: gross_margin_pct,     floor: 18.0}
+  - {name: unsubscribe_rate_pct, ceiling: 0.8}
+secondary_metrics: [aov_30d, category_breadth_30d]    # 只生成下一輪假說，不得下結論
+
+# ── 設計：分派單位必須等於分析單位 ──────────────────────
+design:
+  method: ab_individual             # ab_individual|geo|switchback|did|synthetic|prepost
+  assign_unit: cust_id
+  analysis_unit: cust_id            # 必須 == assign_unit，否則回 15 §三 換方法
+  stratify_by: [rfm_segment, has_pre_period]
+  allocation: {treat: 0.5, control: 0.5}
+  seed: 20260315
+  # 地理實驗才填：
+  geo_units_per_arm: —
+  icc_estimated: —                  # 從自己的資料估，不准套用經驗值
+  deff: —
+
+# ── 檢定力：這是硬閘門，verdict=BLOCKED 就不准開跑 ────────
+power:
+  alpha: 0.05
+  tails: 2
+  power: 0.80
+  mde_abs_pp: 0.5
+  n_per_arm_required: 20900
+  n_per_arm_available: 967
+  verdict: BLOCKED                  # OK | BLOCKED
+  options: ["跨群擴大名單", "α放寬至0.20（依18-E18聲明）", "改地理實驗"]
+  cuped:
+    covariate: repurchase_rate_30d_pre
+    pre_window_days: 90             # ≥ 1 個購買週期
+    expected_rho: N/A               # 有歷史資料就先估；ρ<0.3 不值得做
+
+# ── 期間 ────────────────────────────────────────────────
+schedule:
+  start: 2026-04-01
+  end: 2026-05-27                   # ≥ 2 個購買週期 + 新奇效應觀察期
+  length_reason: "λ 中位數 10.79 天 → 22 天為下限；取 8 週以觀察新奇效應衰減"
+  holiday_overlap: ["母親節 05/10"]  # 兩組同時暴露則不構成混淆，仍須登錄
+
+# ── 成功判準：事先寫死，事後不得修改 ─────────────────────
+decision_rule:
+  success_threshold: "效果 ≥ +2.5pp 且 95%CI 下界 > 0 且無護欄越線"
+  if_success: "全客群推廣，預算 180 萬"
+  if_fail:    "停止此方案，改測折抵金額 150 元版本"
+  # 若 if_success == if_fail → 這個實驗不做（01 §3.4 決策連結規則）
+stop_early_if:
+  - "unsubscribe_rate_pct > 0.8 連續 3 天"
+  - "簡訊發送失敗率 > 5%"
+  - "SRM 檢定 p < 0.001"
+  - "序貫邊界：僅在事前登記 alpha-spending 時允許；否則主要指標不得中途查看"
+
+# ── 分析計畫：事前寫定，事後不得換模型 ───────────────────
+analysis_plan:
+  model: "y ~ treat + C(stratum)"
+  se: nonrobust                     # 一列一顧客；地理/switchback 改 cluster（15 §六）
+  cluster_var: —
+  multiplicity: "主要指標僅1個，不校正；次要指標套 BH FDR（18-G8）"
+  missing: "退出者依 ITT 保留在原組，不得刪除"
+  cuped_theta_estimated_on: pooled  # 必須合併兩組估，分組估會吃掉處理效果
+
+evidence_level_target: 實驗

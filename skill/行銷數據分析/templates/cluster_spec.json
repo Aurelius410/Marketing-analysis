@@ -1,0 +1,58 @@
+{
+  "_說明": "M6 分群的規格檔，存到 projects/<代號>/05_models/cluster_spec.json。三件事：(1) 讓換一批資料重跑時用同一組決策；(2) 提供 verify_outputs.py 的 S1 gate 資料來源（input_vars）；(3) transform/scaler/distance 任一為 none 時，報告必須寫理由。規格見 references/07_標籤與分群.md §3.3。",
+
+  "input_vars": ["r_days_since_last_sale", "ln_f", "ln_m", "cai", "cri"],
+  "_input_vars_白名單": "只准 R / F / M / RFM Score / CAI / CRI / 因素分數 / LN_F / LN_M（18-E2）。人口統計變數一律禁止，它們只出現在卡方那一章。",
+
+  "transform": {
+    "r_days_since_last_sale": "none",
+    "ln_f": "log1p",
+    "ln_m": "log1p",
+    "cai": "none",
+    "cri": "none"
+  },
+  "_transform_規則": "skew > 1 才轉換（M4 三門檻）。CAI 可正可負，不可 log。轉換後複檢排序相關 > 0.95。順位表見 06_前處理與轉換.md §1.2。",
+
+  "scaler": "zscore",
+  "scaler_path": "05_models/scaler.json",
+  "_scaler_規則": "非監督在整個分析集上 fit（沒有 train/test 概念）。有離群且已走完 06 §三 → robust。none 要寫理由。",
+
+  "distance": "euclidean",
+  "_distance_規則": "白名單全是低維連續行為指標，預設 euclidean。品類佔比 → cosine；購買清單 0/1 → jaccard。",
+
+  "algorithm": "kmeans",
+  "k": 4,
+  "seed": 42,
+  "n_init": 10,
+  "_k_理由": "寫在 params.yml 的 k 段（四欄：值／理由／出處／敏感度）。此處只記結果，理由不重複兩份。",
+
+  "preflight": {
+    "gate1_scale_ratio": null,
+    "gate1_pass": null,
+    "gate2_skew_max_abs": null,
+    "gate2_pass": null,
+    "gate3_max_wgss_contribution_pct": null,
+    "gate3_pass": null,
+    "gate4_max_cluster_condition_number": null,
+    "gate4_pass": null,
+    "gate5_within_dist_ratio": null,
+    "gate5_pass": null
+  },
+  "_preflight_說明": "gate1–3 事前可驗，gate4–5 只能 fit 之後驗。gate4/5 未過要在報告誠實寫明，並用 §六 的 HDBSCAN 交叉比對補強。",
+
+  "validation": {
+    "silhouette_mean": null,
+    "gap_best_k": null,
+    "ch_best_k": null,
+    "bootstrap_ari_median": null,
+    "bootstrap_ari_iqr": null,
+    "structure_pvalue": null,
+    "hdbscan_ari": null,
+    "hdbscan_noise_pct": null,
+    "min_cluster_pct": null
+  },
+  "_validation_門檻": "bootstrap_ari_median >= 0.60 才可用、>= 0.75 才算穩定；min_cluster_pct >= 5% 且最小群 >= 30 人；hdbscan_ari > 0.6 = 可信。不過關走 07 §7.3 的降級階梯。",
+
+  "anova_tested_vars": [],
+  "_S1_gate": "set(input_vars) ∩ set(anova_tested_vars) 必須為空集合，否則 verify_outputs.py fail。對分群輸入變數跑 ANOVA 是循環推論（07 §8.2）。"
+}
