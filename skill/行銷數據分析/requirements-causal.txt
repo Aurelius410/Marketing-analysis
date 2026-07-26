@@ -1,0 +1,24 @@
+# 行銷數據分析 Skill — 因果推論次環境（必須 Python 3.12）
+#
+#     py -3.12 -m venv .venv-causal
+#     .venv-causal\Scripts\pip install -r requirements-causal.txt      # Windows
+#     .venv-causal/bin/pip install -r requirements-causal.txt          # macOS/Linux
+#
+# 為什麼要分環境（實測結果，不是預防性建議）：
+#   · dowhy    在 Python 3.14 會「安裝成功」但**靜默降版到 0.8（2022 年版）**，pip 不警告
+#   · EconML   無 cp314 wheel，退回原始碼編譯失敗
+#   · meridian 相依 TensorFlow，而 TensorFlow 無 cp314 wheel
+#
+# 兩個環境用 Parquet 交換資料 —— 這正好是倉儲層本來就在用的格式，不是妥協。
+
+dowhy>=0.12
+econml>=0.15
+causalml>=0.15             # uplift 級 2；需 MSVC Build Tools 編譯 Cython
+google-meridian>=1.7       # MMM；相依 TensorFlow
+
+# 次環境也要能讀寫 Parquet 與做基本處理
+duckdb>=1.5
+pyarrow>=17
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5

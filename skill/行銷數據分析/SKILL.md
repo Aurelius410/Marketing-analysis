@@ -89,7 +89,8 @@ description: |
 | 報告 | Jinja2 單檔 HTML ｜投影片 python-pptx ｜儀表板 Altair→marimo 分層 |
 | 字型 | 中文微軟正黑體、英文 Times New Roman、內文 ≥12pt（對外嵌入時切 Noto Sans TC）|
 | 對話語言 | 繁體中文 |
-| 專案根目錄 | `E:\Projects\行銷分析\projects\<專案代號>\` |
+| 專案根目錄 | 由 `scripts/paths.py` 解析 —— 預設 `<skill 所在 repo>/projects/<專案代號>/`，可用 `config.yml` 覆蓋 |
+| 可攜性 | 整個 `行銷數據分析/` 資料夾可直接複製到任何機器。**新機器先跑 `python scripts/setup_check.py`** |
 
 ## 十三個模組
 

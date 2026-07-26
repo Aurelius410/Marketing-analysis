@@ -25,7 +25,12 @@ from pathlib import Path
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
-DEFAULT_ROOT = Path(r"E:\Projects\行銷分析")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from paths import SKILL_ROOT
+    DEFAULT_ROOT = SKILL_ROOT.parent.parent      # skill/<名稱>/ → skill/ → repo root
+except ImportError:                              # 單獨複製這支腳本時的退路
+    DEFAULT_ROOT = Path.cwd()
 
 # --- 要匿名化的第三方 ---------------------------------------------------
 # 依在素材庫出現的次數排序，代號一經指定就不要再改（否則舊文件對不上）
