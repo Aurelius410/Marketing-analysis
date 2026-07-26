@@ -1,58 +1,72 @@
-# 行銷數據分析 Skill — 主環境（Python 3.13 或 3.14）
+# 行銷數據分析 Skill — 主環境
+#
+# 實測環境：Windows 11 + Python 3.14.1（2026-07-26 實跑，不是 dry-run 推測）
 #
 #     pip install -r requirements.txt
 #
-# ⚠ 因果推論（dowhy / EconML / causalml / meridian）不在這裡。
-#   Python 3.14 裝 dowhy 會靜默降版到 2022 年的 0.8 版且不警告。
-#   那幾個套件請用 requirements-causal.txt 裝在 Python 3.12 次環境。
+# ⚠ 為什麼分成四層而不是一份清單：
+#   pip 是**全有全無**的。實測發現 great-tables 的相依 multimark 在 3.14 編譯失敗，
+#   結果**其餘 20 個套件一個都沒裝**。分層之後，一層失敗不會拖垮其他層。
+#   照順序裝，某一層失敗就跳過它繼續下一層。
 
-# ── 倉儲與資料處理 ───────────────────────────────────────
+# ═══ 第 1 層：核心（沒有它整條管線動不了）═══════════════
 duckdb>=1.5
 pyarrow>=17
-polars>=1.20
+polars>=1.43
 pandas>=2.2
 numpy>=2.0
-openpyxl>=3.1
 pyyaml>=6.0
+openpyxl>=3.1
+pandera>=0.32
+pytest>=8.0
 
-# ── 資料品質 ─────────────────────────────────────────────
-pandera>=0.22
-
-# ── 統計（取代 R 那一套）─────────────────────────────────
+# ═══ 第 2 層：統計（M2/M4/M6/M7/M16）═══════════════════
 scipy>=1.14
 statsmodels>=0.14.5        # ols / glm / anova_lm / Cook's D / VIF / 巢狀 F
 pingouin>=0.5.5            # 事後檢定、效果量
-scikit-posthocs>=0.9       # 無母數事後檢定
+scikit-posthocs>=0.14      # 無母數事後檢定
+scikit-learn>=1.9          # 1.3 起內建 HDBSCAN，不需另裝 hdbscan
 
-# ── 機器學習與分群 ───────────────────────────────────────
-scikit-learn>=1.5          # 1.3 起內建 HDBSCAN，不需另裝 hdbscan
-xgboost>=2.1
-lightgbm>=4.5
-catboost>=1.2              # 高基數類別特徵最省事
-shap>=0.46                 # 不要用 tree importance，對高基數欄位有偏
-
-# ── 行銷專用模型 ─────────────────────────────────────────
-mlxtend>=0.23              # 購物籃 apriori / fpgrowth
+# ═══ 第 3 層：模型（M8/M9）═══════════════════════════════
+xgboost>=3.3
+lightgbm>=4.7
+catboost>=1.2
+shap>=0.52                 # 不要用 tree importance，對高基數欄位有偏
+mlxtend>=0.25              # 購物籃 apriori / fpgrowth
 factor_analyzer>=0.5       # 因素分析，取代 SPSS
-lifelines>=0.29            # 存活分析（注意：同作者的 lifetimes 已 archived）
-scikit-survival>=0.23
-statsforecast>=1.7
-pymc-marketing>=0.10       # CLV (BG/NBD + Gamma-Gamma) 與 MMM
-tea-tasting>=0.6           # A/B 測試、CUPED
-
-# ── 文本 ─────────────────────────────────────────────────
+lifelines>=0.30            # 存活分析（注意：同作者的 lifetimes 已 archived）
+statsforecast>=2.1
+tea-tasting>=2.0           # A/B 測試、CUPED
 jieba>=0.42                # 中文斷詞（繁中建議另裝 ckip-transformers）
 
-# ── 視覺化與交付 ─────────────────────────────────────────
-altair>=5.5
-vl-convert-python>=1.7     # Altair → PNG/PDF，不需 node
-matplotlib>=3.9
+# pymc-marketing：CLV (BG/NBD + Gamma-Gamma) 與 MMM
+# ⚠ 實測可裝，但 pytensor 會警告「g++ not available」→ 退回 Python 實作，
+#   效能嚴重降級。要正常速度需先裝 MSVC Build Tools 或 mingw-w64。
+#   單純算 CLV 可接受；跑 MMM 取樣會很慢。
+pymc-marketing>=0.19
+
+# ═══ 第 4 層：視覺化與交付（M19/M20）═════════════════════
+altair>=6.2
+vl-convert-python>=1.9     # Altair → PNG/PDF，不需 node（abi3 wheel，3.14 可用）
+matplotlib>=3.11
 seaborn>=0.13
-great-tables>=0.14
 jinja2>=3.1                # 單檔 HTML 報告
 xlsxwriter>=3.2
 python-pptx>=1.0
-marimo>=0.10               # 儀表板 L2/L3（L1 用 Altair 即可）
+marimo>=0.23               # 儀表板 L2/L3（L1 用 Altair 即可）
 
-# ── 開發 ─────────────────────────────────────────────────
-pytest>=8.0
+# ═══ 在 Python 3.14 裝不起來的（實測，2026-07-26）═════════
+#
+# great-tables
+#   相依 multimark 編譯失敗（failed-wheel-build-for-install）。
+#   替代：HTML 表格改用 Jinja2 + CSS token 自己排（本來就要做 CSS token），
+#         或用 pandas.Styler。references/19 與 20 的表格規格照舊，只是實作換手。
+#
+# scikit-survival
+#   相依 ecos（凸最佳化求解器）編譯失敗。
+#   替代：lifelines 已涵蓋 Kaplan-Meier 與 Cox（M8-1 的存活分析夠用）。
+#         scikit-survival 提供的是 ML 風味（Random Survival Forest），
+#         真的需要時走 Python 3.12 次環境。
+#
+# 這兩個都是「相依的 C 擴充在 3.14 沒有 wheel」，不是套件本身死了。
+# 之後上游補了 wheel 就能裝回來 —— 每次重建環境時值得重試一次。
