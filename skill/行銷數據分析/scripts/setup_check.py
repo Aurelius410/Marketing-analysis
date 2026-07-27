@@ -187,6 +187,97 @@ def check_references() -> None:
         ok(f"references 齊全（{len(EXPECTED_REFS)} 份）")
 
 
+# ── 4b. scripts/ 完整性 ──────────────────────────────────
+# references 把這些 script 當硬規則引用（「唯一合法介面」「必經」「不准繞過」），
+# 缺了對應模組就走不下去。缺席是 error 不是 warning —— 沒有它，紀律鏈是斷的。
+BLOCKING_SCRIPTS: dict[str, str] = {
+    "check_data_quality.py":
+        "M1 三桶 + exit code，是 M1→M2 唯一的放行機制（04 §一）",
+    "db.py":
+        "唯一合法的連線介面，03 §7.1 明訂禁止各自 duckdb.connect()",
+    "stats_utils.py":
+        "唯一合法的 type-III ANOVA/EMM（08 §121、16 §249）；"
+        "直接呼叫 anova_lm(typ=3) 會靜默算錯",
+    "build_features.py":
+        "18-G4 明訂 build_features(as_of) 是特徵表唯一介面；"
+        "17 §5 禁止在分析腳本裡就地手寫指標公式",
+    "verify_outputs.py":
+        "交付 gate，SKILL.md 品質清單最後一項、六份 reference 的匯流點",
+}
+
+# 主線 M1–M6 會用到，缺了那一段要手工重做
+MAINLINE_SCRIPTS: dict[str, str] = {
+    "profile_dataset.py": "M1 步驟①③ 資料剖析",
+    "check_schema_contract.py": "M1 步驟② 欄位契約比對",
+    "pick_transform.py": "M3 轉換方法選用",
+    "retransform.py": "M3 重新轉換",
+    "write_transform_log.py": "M3 transform_log 落地",
+    "prep_cluster_matrix.py": "M6 分群前必經前處理（07 §159）",
+}
+
+# 單一模組的工具，缺了只影響該模組
+MODULE_SCRIPTS: dict[str, str] = {
+    "scan_columns.py": "M9 預測（12）", "split_time.py": "M9 時序切分（12）",
+    "calibrate.py": "M9 機率校準（12）", "explain_model.py": "M9 SHAP（12）",
+    "model_monitor.py": "M9 監控（12）",
+    "kmeans_preflight.py": "M6 分群前檢（07）",
+    "cluster_validity.py": "M6 分群效度（07）",
+    "basket_gates.py": "M8-2 購物籃三閘門（10）",
+    "text_prep.py": "M10 文本前處理（13）",
+    "robustness.py": "M7 穩健性檢查（16）",
+    "experiment_power.py": "M11 檢定力與樣本數（15）",
+    "size_recommendation.py": "M13 行動規模建議（14）",
+    "collect_figures.py": "唯一允許把圖放進 圖表/報告用/ 的方式（19 §6.2）",
+    "check_fonts.py": "字型可用性（19、20）",
+    "palette_lab.py": "色盤檢查（18、19）",
+    "build_report.py": "報告產製（20 §3.2）",
+    "result_bundle.py": "結果打包（20）", "stamp_version.py": "版本戳記（20）",
+    "build_lineage.py": "lineage 產製（03 §6.3）",
+    "diff_runs.py": "兩個 run_id 差異歸因（03 §6.3）",
+    "maintain_ducklake.py": "snapshot 保護與過期（03 §6.4）",
+    "export_for_causal.py": "匯出給 3.12 次環境（03 §7.2）",
+    "causal/did_analysis.py": "M12 因果推論（次環境）",
+}
+
+# 04 §547 明訂：Q1/Q6/Q7/Q8/Q10/Q11/Q12 在課程資料集上永遠不會變紅，
+# 必須拿這個髒樣本去驗檢查器本身。
+EXPECTED_FIXTURES = ["tests/fixtures/dirty_mini.parquet"]
+
+
+def check_scripts() -> None:
+    sd = SKILL_ROOT / "scripts"
+    missing_block = {n: why for n, why in BLOCKING_SCRIPTS.items()
+                     if not (sd / n).exists()}
+    if missing_block:
+        err(f"缺少 {len(missing_block)}/{len(BLOCKING_SCRIPTS)} 支 gate 級腳本",
+            "references 把它們寫成「唯一合法介面」，缺了紀律鏈是斷的：")
+        for n, why in missing_block.items():
+            errors.append(f"    · {n:<24} {why}")
+    else:
+        ok(f"gate 級腳本齊全（{len(BLOCKING_SCRIPTS)} 支）")
+
+    missing_main = {n: why for n, why in MAINLINE_SCRIPTS.items()
+                    if not (sd / n).exists()}
+    if missing_main:
+        warn(f"缺少 {len(missing_main)}/{len(MAINLINE_SCRIPTS)} 支 M1–M6 主線腳本",
+             "那幾步要手工重做：")
+        for n, why in missing_main.items():
+            warnings.append(f"    · {n:<24} {why}")
+
+    missing_mod = {n: why for n, why in MODULE_SCRIPTS.items()
+                   if not (sd / n).exists()}
+    if missing_mod:
+        warn(f"缺少 {len(missing_mod)}/{len(MODULE_SCRIPTS)} 支單模組腳本",
+             "對應模組不可用：")
+        for n, why in missing_mod.items():
+            warnings.append(f"    · {n:<24} {why}")
+
+    missing_fx = [f for f in EXPECTED_FIXTURES if not (SKILL_ROOT / f).exists()]
+    if missing_fx:
+        warn(f"缺少測試 fixture：{', '.join(missing_fx)}",
+             "無法驗證品質檢查器本身（04 §六：七條檢查在課程資料集上永遠不會變紅）")
+
+
 # ── 5. 次環境與外部工具 ──────────────────────────────────
 def check_causal_env() -> None:
     p = causal_venv_python()
@@ -273,7 +364,8 @@ def main() -> int:
     print("=" * 64)
 
     for fn in (check_python, check_packages, check_paths, check_references,
-               check_causal_env, check_tools, check_duckdb_smoke, check_fonts):
+               check_scripts, check_causal_env, check_tools,
+               check_duckdb_smoke, check_fonts):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
@@ -295,14 +387,17 @@ def main() -> int:
         print("\n⛔ 不能開工，必須先處理")
         print("-" * 64)
         for m in errors:
-            print(f"  ⛔ {m}")
+            print(f"  {m}" if m.startswith("    ") else f"  ⛔ {m}")
 
     print("\n" + "=" * 64)
+    # 縮排的是上一條的明細行，不另計為一項
+    n_err = sum(1 for m in errors if not m.startswith("    "))
+    n_warn = sum(1 for m in warnings if not m.startswith("    "))
     if errors:
-        print(f"結果：{len(errors)} 個 error、{len(warnings)} 個 warning → 不能開工")
+        print(f"結果：{n_err} 個 error、{n_warn} 個 warning → 不能開工")
         return 1
     if warnings:
-        print(f"結果：{len(warnings)} 個 warning → 可以開工，部分模組不可用")
+        print(f"結果：{n_warn} 個 warning → 可以開工，部分模組不可用")
         return 2
     print(f"結果：全部通過（{len(infos)} 項）→ 可以開工")
     return 0

@@ -1,6 +1,10 @@
 -- 各通路 cohort 的累積毛利曲線 → payback period（M8-3 §四）
 -- 規格見 references/11_行銷_成長與促銷.md §4.3
--- 參數：:gross_margin（毛利率，ratio）
+-- 參數：$gross_margin（毛利率，ratio）
+-- DuckDB 具名參數是 $name，不是 :name。綁法：con.execute(sql, {"gross_margin": 0.35})
+--
+-- 依賴：dim_customer.first_purchase_date 與 dim_customer.acquisition_channel_key
+-- （02 §3.2 的兩個 Type 1 衍生欄，由 fact_transaction／首單歸因回算後物化）。
 --
 -- Payback_m = min{ m : Σ_{k=1..m} GM_k(cohort) >= CAC }
 -- GM_k 是「已實現」人均毛利，不是預測值 —— 這正是 payback 比 CLV/CAC 穩健的原因。
@@ -20,7 +24,7 @@ size AS (
 gm AS (
     SELECT co.ch, co.cohort_m,
            DATE_DIFF('month', co.cohort_m, DATE_TRUNC('month', t.biz_date)) AS m_since,
-           SUM(t.amount_twd * :gross_margin)                                AS gm_twd
+           SUM(t.amount_twd * $gross_margin)                                AS gm_twd
     FROM fact_transaction t
     JOIN cohort co USING (person_key)
     WHERE t.txn_type = 'sale' AND t.is_test_txn = FALSE
