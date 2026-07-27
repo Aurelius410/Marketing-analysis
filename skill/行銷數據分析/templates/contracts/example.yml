@@ -1,0 +1,160 @@
+# ═══════════════════════════════════════════════════════════════════════
+# contracts/<source>.yml — 資料契約範本
+#
+# 規格出處：02_資料模型規格.md §十｜比對機制：04_資料體檢.md §一 步驟②
+# 放置位置：<專案>/原始資料/contracts/<source>.yml，**檔名必須等於 source**
+#
+# 用法：
+#   cp templates/contracts/example.yml <專案>/原始資料/contracts/ntu_creditcard.yml
+#   python scripts/check_schema_contract.py <專案代號> --source ntu_creditcard
+#
+# 本範本用台大 IB5082 信用卡資料集的**實際欄位**寫成，不是虛構欄名 ——
+# 照著改欄名就能用，也能直接拿 samples/ 的三個 parquet 跑通比對。
+#
+# ⚠ 契約只能 append。改了 grain、刪了 renames 的舊鍵，半年前那份報告就重跑不出來
+#    （02 §十 末段、02 §九 DDL append-only 同一條理由）。
+#    check_schema_contract.py 會把 grain 與 renames 存快照，下次偷改直接擋。
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── 必填四鍵 ───────────────────────────────────────────────────────────
+source:     ntu_creditcard          # 與檔名、_source_file、ingest_watermark.source 同字串
+encoding:   utf-8                   # 台灣 POS/CRM 匯出大量是 big5，不准留空靠猜（03 W1）
+source_tz:  Asia/Taipei             # IANA 時區。無宣告的 TIMESTAMP 欄不准進 staging（02 §四）
+
+# grain：一列代表什麼。checks/<table>__grain_unique.sql 直接讀這裡，不准把欄名寫死在 SQL
+#   多表來源寫成「表名: [欄位…]」；單表來源可直接寫一個 list。
+#   表名 = 檔名去掉 "<source>__" 前綴（ntu_creditcard__transactions.parquet → transactions）
+grain:
+  transactions: [交易序號]
+  customers:    [客戶ID]
+  step5_cai:    ['Custom ID']
+
+# ── columns：名稱＋型別＋單位＋可空＋實務用途 ──────────────────────────
+# 五個鍵全部必填（02 §十）。practical_use 填不出來代表這欄還沒被想清楚，不准留空。
+#   dtype          金額一律 DECIMAL(18,4)，禁止 DOUBLE/FLOAT
+#   unit           ratio / percent / <ISO 幣別> / days / count / '—'；率欄位必填
+#   nullable       true / false
+#   practical_use  subject_key / fk / time_axis / measure / segment_input / profile_only / helper
+#   table          （本 skill 擴充）標明這欄屬於哪張表。02 §十 的範例是跨表聯集清單，
+#                  但同一個欄名在不同表的角色會不同（客戶ID 在交易檔是 fk、在客戶檔是
+#                  subject_key），所以這裡允許逐表宣告。省略 table 代表「任一表都算數」。
+columns:
+  # ---- transactions：信用卡交易記錄檔（7,764 筆） ----
+  - {table: transactions, name: 交易序號,       dtype: BIGINT,        unit: '—',   nullable: false, practical_use: subject_key,
+     note: '本表 grain 鍵。分析主體仍是 客戶ID（04 §二）'}
+  - {table: transactions, name: 信用卡ID,       dtype: BIGINT,        unit: '—',   nullable: false, practical_use: fk,
+     note: '相異值 130 vs 客戶ID 100。card_id 不得當分析主體，會得到 130 個假顧客（04 §二）'}
+  - {table: transactions, name: 客戶ID,         dtype: BIGINT,        unit: '—',   nullable: false, practical_use: fk}
+  - {table: transactions, name: 刷卡日期,       dtype: DATE,          unit: '—',   nullable: false, practical_use: time_axis,
+     note: '唯一可用來切 as_of_date 的欄（18-G4）。範圍 2010-12-01 ~ 2012-11-30'}
+  - {table: transactions, name: 刷卡產品產業分類, dtype: VARCHAR,     unit: '—',   nullable: false, practical_use: profile_only,
+     note: '編碼前綴不連續且 X2 用點分隔，split(chr(95)) 會爆（04 Q13）'}
+  - {table: transactions, name: 刷卡類型,       dtype: VARCHAR,       unit: '—',   nullable: false, practical_use: profile_only}
+  - {table: transactions, name: 刷卡金額,       dtype: 'DECIMAL(18,4)', unit: TWD,   nullable: false, practical_use: measure,
+     note: '無 currency 欄，依量級與地名判定 TWD（04 Q16）'}
+  - {table: transactions, name: 刷卡地點,       dtype: VARCHAR,       unit: '—',   nullable: false, practical_use: profile_only}
+
+  # ---- customers：客戶資料檔（100 位） ----
+  - {table: customers, name: 客戶ID,            dtype: BIGINT,        unit: '—',   nullable: false, practical_use: subject_key}
+  - {table: customers, name: 年齡,              dtype: BIGINT,        unit: '—',   nullable: false, practical_use: profile_only,
+     note: '人口統計變數只能進卡方那一章，不准進分群（18-E2）'}
+  - {table: customers, name: 生日,              dtype: DATE,          unit: '—',   nullable: false, practical_use: profile_only,
+     note: '100/100 唯一但語意是日期，不可標 suspected_id（04 §二 反例）'}
+  - {table: customers, name: 居住地,            dtype: VARCHAR,       unit: '—',   nullable: false, practical_use: profile_only}
+  - {table: customers, name: 教育程度,          dtype: VARCHAR,       unit: '—',   nullable: false, practical_use: profile_only}
+  - {table: customers, name: 性別,              dtype: VARCHAR,       unit: '—',   nullable: false, practical_use: profile_only,
+     note: "值是「代碼:標籤」黏接的複合值，groupby 前要 split(':')（04 Q10）"}
+  - {table: customers, name: 婚姻狀況,          dtype: VARCHAR,       unit: '—',   nullable: false, practical_use: profile_only}
+  - {table: customers, name: 職業,              dtype: VARCHAR,       unit: '—',   nullable: false, practical_use: profile_only}
+  - {table: customers, name: 辦第一張信用卡的時間, dtype: DATE,       unit: '—',   nullable: false, practical_use: profile_only,
+     note: '25/100 晚於卡片檔最早開卡日、最大差 5,669 天。不可用來算卡齡，改用 min(信用卡開卡日)（04 Q14）'}
+  - {table: customers, name: 'Unnamed: 10',     dtype: VARCHAR,       unit: '—',   nullable: true,  practical_use: helper,
+     note: '缺失率 1.00%，值是 客戶ID 的複本，進相關矩陣會得到 r=1.00（04 Q9、18-E10）'}
+  - {table: customers, name: CAI,               dtype: VARCHAR,       unit: '—',   nullable: false, practical_use: helper,
+     note: 'Present/Missing 旗標，不是 CAI 數值本身。數值在 step5_cai'}
+
+  # ---- step5_cai：課程 Step 5 的 CAI 名單（99 位） ----
+  - {table: step5_cai, name: 'Custom ID',       dtype: BIGINT,        unit: '—',     nullable: false, practical_use: subject_key}
+  - {table: step5_cai, name: MLE,               dtype: 'DECIMAL(18,6)', unit: days,    nullable: false, practical_use: measure,
+     note: '平均購買間隔。客戶 89 = 10.279412（17 §四 基準值）'}
+  - {table: step5_cai, name: 'Sum of Weight',   dtype: BIGINT,        unit: count,   nullable: false, practical_use: measure}
+  - {table: step5_cai, name: 'Sum of Product',  dtype: BIGINT,        unit: count,   nullable: false, practical_use: measure}
+  - {table: step5_cai, name: WMLE,              dtype: 'DECIMAL(18,6)', unit: days,    nullable: false, practical_use: measure,
+     note: '加權平均間隔。客戶 89 = 11.570759'}
+  - {table: step5_cai, name: CAI,               dtype: 'DECIMAL(18,6)', unit: percent, nullable: false, practical_use: segment_input,
+     note: '17 §4.2 的公式帶 ×100，所以口徑是 percent 不是 ratio。值域 −43.665943 ~ +54.590571；客戶 89 = −12.562460。
+            若要與其他率欄位並列建模，staging 除以 100 轉成 ratio 再存（02 §十）'}
+
+# ── enum_domains：類別欄的合法值（本 skill 擴充，02 §十 未定義此鍵）────────
+# 為什麼要釘：上游多一個沒見過的分類，groupby 會多一列、對照表會漏接、卡方的期望次數
+# 會被稀釋，而全程零報錯。這是 04 Q13「編碼序號缺口與命名破格」的事前版本。
+#   兩種寫法：  欄名: [合法值…]
+#              欄名: {table: …, values: […], on_unknown: error|warn, note: …}
+#   on_unknown 預設 error。sentinels 宣告過的值自動豁免。
+enum_domains:
+  刷卡類型:
+    table: transactions
+    values: [一般消費, 分期消費]
+  刷卡地點:
+    table: transactions
+    values: [國內, 國外]
+  刷卡產品產業分類:
+    table: transactions
+    on_unknown: error
+    note: '數字前綴缺 01、04，且 X2.中信錢加值 用點分隔 —— 破格值本身合法，不准當髒資料清掉'
+    values: ['02_學費/教育', '03_保險', '05_捐贈', '06_公用事業', '07_百貨', '08_精品',
+             '09_餐飲', '10_藥妝', '11_3C居家電信', '12_量販超市', '13_交通(含加值)',
+             '14_旅遊', '15_休閒文化', '16_無店舖', 'X2.中信錢加值']
+  居住地:
+    table: customers
+    values: [大台北地區, 台中地區, 嘉南地區, 高屏地區]
+  教育程度:
+    table: customers
+    values: [初中及初中以下, 高中, 專科, 學士, 研究所以上, 其他]
+  性別:
+    table: customers
+    values: ['1:男', '2:女']
+  婚姻狀況:
+    table: customers
+    values: [單身, 已婚]
+  職業:
+    table: customers
+    values: [公務員, 軍警, 農漁民, 自營事業老闆, 自由業, 專業(技術)人員, 白領主管,
+             白領一般職員, 一般服務從業人員, 藍領(工廠及製造業)主管,
+             '藍領(勞動工作或作業員)一般職員', 退休或無業, 其他]
+  CAI:
+    table: customers
+    values: [Present, Missing]
+    note: '這是 customers 的旗標欄，不要跟 step5_cai.CAI 數值欄搞混'
+
+# ── renames：舊欄名 → 新欄名，append-only ─────────────────────────────
+# 為什麼不准刪舊鍵：union_by_name 遇到欄位改名會**靜默拆成兩欄、各半 NULL**。
+# Meta 報表 Amount spent (TWD) 改叫 Spend → 近三個月 spend 全 NULL → ROAS 從 1.6 算成
+# 3.2 → 「建議預算加倍」，全程零報錯（03 W5、gap D1）。
+# staging 一律 COALESCE(新名, 舊名) AS 新名 接住。
+renames: {}
+# 範例（兩個舊名收斂到同一個新名，就是要這樣寫）：
+# renames:
+#   'Amount spent (TWD)': spend
+#   Spend:                spend
+
+# ── sentinels：哨兵值處理方式 ─────────────────────────────────────────
+# action：to_null（換成 NULL）/ keep（保留，語意上就是有效值）/ exclude（整列排除）
+# 沒有 table 鍵時對所有表生效；有 table 但該表不在本次比對範圍 → 跳過並記 info。
+sentinels:
+  - {table: step2_interval, column: int, value: 9999, action: to_null,
+     reason: 'Step 2 的 9999 出現 100 次＝客戶數，是「無下一次消費」的填充值。
+              不排除算平均間隔 199.46，真值 10.79，差 18.5 倍；CAI 的 MLE 是分母，
+              污染後所有人看起來都「節奏穩定」，流失預警完全失效（04 Q2）'}
+  - {table: cards, column: 信用額度, value: 0, action: exclude,
+     reason: '信用卡 19817 額度 0 是 1998 到期的停用卡殘留。額度使用率會除零得 inf，
+              mean() 整欄變 inf，排行表報廢（04 Q5）'}
+
+# ── quality_overrides：exit code 1 的唯一解除途徑 ─────────────────────
+# 四個鍵缺一不可（rule / decision / reason / decided_by / decided_on）——
+# 少一個就等於「有人默默把紅燈關掉且沒人知道是誰關的」。rule 只能是 Q1–Q16。
+quality_overrides:
+  - {rule: Q2, decision: to_null, reason: '見 sentinels 的 int=9999',
+     decided_by: 包子, decided_on: 2026-07-26}
+  - {rule: Q5, decision: exclude, reason: '信用卡 19817 額度 0 是 1998 到期的停用卡，判定停用並排除',
+     decided_by: 包子, decided_on: 2026-07-26}

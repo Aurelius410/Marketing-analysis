@@ -1,0 +1,47 @@
+{
+  "source": "ntu_creditcard",
+  "saved_at": "2026-07-27T21:53:59",
+  "grain": {
+    "transactions": [
+      "客戶ID",
+      "刷卡日期"
+    ],
+    "customers": [
+      "客戶ID"
+    ],
+    "step5_cai": [
+      "Custom ID"
+    ]
+  },
+  "renames_keys": [
+    "刷卡地點",
+    "自己",
+    "舊欄"
+  ],
+  "columns": [
+    "customers|CAI",
+    "customers|Unnamed: 10",
+    "customers|婚姻狀況",
+    "customers|客戶ID",
+    "customers|居住地",
+    "customers|年齡",
+    "customers|性別",
+    "customers|教育程度",
+    "customers|生日",
+    "customers|職業",
+    "customers|辦第一張信用卡的時間",
+    "step5_cai|CAI",
+    "step5_cai|Custom ID",
+    "step5_cai|MLE",
+    "step5_cai|Sum of Product",
+    "step5_cai|Sum of Weight",
+    "step5_cai|WMLE",
+    "transactions|交易序號",
+    "transactions|信用卡ID",
+    "transactions|刷卡日期",
+    "transactions|刷卡產品產業分類",
+    "transactions|刷卡金額",
+    "transactions|客戶ID",
+    "transactions|消費地區"
+  ]
+}

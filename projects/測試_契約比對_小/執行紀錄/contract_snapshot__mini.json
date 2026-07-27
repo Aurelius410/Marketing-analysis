@@ -1,0 +1,19 @@
+{
+  "source": "mini",
+  "saved_at": "2026-07-27T21:55:34",
+  "grain": {
+    "step5_cai": [
+      "Custom ID"
+    ]
+  },
+  "renames_keys": [],
+  "columns": [
+    "step5_cai|CAI",
+    "step5_cai|Custom ID",
+    "step5_cai|MLE",
+    "step5_cai|Sum of Product",
+    "step5_cai|Sum of Weight",
+    "step5_cai|WMLE",
+    "step5_cai|不存在的欄"
+  ]
+}
