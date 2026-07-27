@@ -2,6 +2,28 @@
 # 用法：複製到 projects/<代號>/開案與問題定義/experiment_design.yml，逐欄填滿。
 # 欄位的意義、每一欄缺了會怎樣，見 references/15_實驗設計.md §七 的規格表。
 # 空值符號沿用 00_通則與紀律.md §四：N/A = 有樣本算不出來；— = 無樣本。
+#
+# ── 複製後要改哪幾個欄位才能用 ─────────────────────────────────────────
+#   下面**每一個值都是台大信用卡資料集那條 R2 喚回建議的實例**，不是預設值。
+#   照抄不改等於交了別人的實驗設計。必改的順序：
+#     1. experiment_id / source_hypothesis_id / source_recommendation
+#        —— 對得回 開案與問題定義/hypothesis_register.csv 與 交付物/sizing.csv 的 rec_id。
+#     2. hypothesis —— 01 §3.3 三格句。第三格一定要帶方向／區間／門檻，
+#        寫不出第三格代表這個實驗還沒想清楚要看什麼。
+#     3. primary_metric.{name,metric_def_id,baseline,baseline_sd}
+#        —— baseline 必須從**你自己的資料**算，不准套用經驗值或本範本的 0.032。
+#     4. design.{assign_unit,analysis_unit,stratify_by,seed}
+#        —— analysis_unit 必須 == assign_unit，不等就回 15 §三 換方法，不要硬跑。
+#     5. power.{mde_abs_pp,n_per_arm_required,n_per_arm_available,verdict}
+#        —— 這是硬閘門。本範本示範的正是 BLOCKED（要 20,900／只有 967）的樣子；
+#        你算出來是 OK 才可以填 OK，不准為了往下跑就改成 OK。
+#     6. schedule.{start,end,length_reason} —— length_reason 要寫你這批資料的 λ，
+#        不是本範本的 10.79 天。
+#     7. decision_rule.{success_threshold,if_success,if_fail}
+#        —— if_success == if_fail 時這個實驗不做（01 §3.4 決策連結規則）。
+#     8. analysis_plan.{model,se,cluster_var} —— 一列一顧客才可以留 nonrobust。
+#   ⚠ 目前沒有腳本讀這個檔（M12 的檢查器尚未實作），所以**沒有任何自動關卡會擋你**。
+#      這份是人工審的：填不滿就不要開跑。
 
 experiment_id: EXP-2026-03
 hypothesis: "我認為對群2沉睡高價值客發簡訊喚回券會提高30天內回購率，

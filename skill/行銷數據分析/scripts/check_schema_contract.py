@@ -29,11 +29,13 @@
   · grain 唯一性 —— 04 §三 要求 grain 變成持續斷言，Q6 判 error。本腳本一併跑，
     fail closed（寧可兩支腳本都擋，不要兩支都以為對方會擋）。
 
-三桶 + 退出碼（與 setup_check.py、check_data_quality.py、verify_outputs 同一套，不准對調）：
-    0 = 三桶皆空或只有 info      → 可進步驟③
-    1 = 有 error                 → 擋住，必須在契約裡宣告處理方式後重跑
-    2 = 只有 warning             → 可往下，但條目要進報告的「資料限制」節
-    3 = 腳本本身失敗             → 修腳本，不准手動略過
+三桶 + 退出碼（全庫統一，權威定義見 00 §八；與 setup_check.py、
+check_data_quality.py、verify_outputs 同一套，不准對調）：
+    0  = 三桶皆空或只有 info      → 可進步驟③
+    1  = 有 error                 → 擋住，必須在契約裡宣告處理方式後重跑
+    2  = 只有 warning             → 可往下，但條目要進報告的「資料限制」節
+    64 = 用法錯誤（旗標打錯、--source 與 --contract 都沒給）→ 比對根本沒跑
+    70 = 腳本本身失敗             → 修腳本，不准手動略過（舊版是 3）
 
 用法：
     # 契約放 <專案>/原始資料/contracts/<source>.yml，實檔放 <專案>/原始資料/
@@ -63,7 +65,13 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from contract import (  # noqa: E402
+    ContractError, is_currency, load_contract, qi, qs as ql,
+)
 from db import connect  # noqa: E402
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_SOFTWARE, GateArgumentParser,
+)
 from paths import project_dir  # noqa: E402
 
 if sys.platform == "win32":
@@ -89,8 +97,9 @@ def info(msg: str) -> None:
     infos.append(msg)
 
 
-class ContractError(Exception):
-    """契約檔本身壞掉（讀不到、YAML 語法錯）。是資料問題不是腳本問題 → 退出碼 1。"""
+# ContractError / load_contract / qi / ql / is_currency 都由 scripts/contract.py 提供
+# （import 在檔頭）—— 本檔與 check_data_quality.py 讀同一個 contracts/<source>.yml，
+# 解析實作只能有一份，否則契約 schema 一改就兩邊分岔。
 
 
 def detail(bucket: list[str], line: str) -> None:
@@ -108,9 +117,8 @@ PRACTICAL_USES = {
     "segment_input", "profile_only", "helper", "deprecated",
 }
 
-# 02 §十：unit 值域。三碼大寫視為 ISO-4217 幣別
+# 02 §十：unit 值域。三碼大寫視為 ISO-4217 幣別（is_currency 在 contract.py）
 UNIT_VOCAB = {"ratio", "percent", "days", "count", "—", "-", "—"}
-_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 
 # 02 §十：sentinels.action
 SENTINEL_ACTIONS = {"to_null", "keep", "exclude"}
@@ -165,10 +173,6 @@ def type_family(dtype: str) -> str:
     return _TYPE_FAMILY.get(t, t.lower() or "unknown")
 
 
-def is_currency(unit: str) -> bool:
-    return bool(_CURRENCY_RE.match((unit or "").strip()))
-
-
 # ══ 資料結構 ════════════════════════════════════════════════════════════
 @dataclass
 class ActualTable:
@@ -180,38 +184,7 @@ class ActualTable:
     n_rows: int = 0
 
 
-def qi(name: str) -> str:
-    """欄位識別子加引號。中文欄名、含空白的 'Custom ID' 都要。"""
-    return '"' + str(name).replace('"', '""') + '"'
-
-
-def ql(value: Any) -> str:
-    """字串常值加引號。"""
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-# ══ 契約載入與自身健檢 ═══════════════════════════════════════════════════
-def load_contract(path: Path) -> dict[str, Any]:
-    try:
-        import yaml
-    except ImportError as e:                      # pragma: no cover
-        raise ContractError(
-            "PyYAML 未安裝，讀不了契約檔 — pip install pyyaml（requirements.txt 第 1 層）"
-        ) from e
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception as e:                        # noqa: BLE001
-        raise ContractError(
-            f"契約 YAML 解析失敗：{path}（{e}）— "
-            f"多半是中文冒號、tab 縮排或引號沒收尾。用 templates/contracts/example.yml 對照"
-        ) from e
-    if not isinstance(data, dict):
-        raise ContractError(
-            f"契約最外層不是 mapping：{path} — 檢查第一行是不是多了 '- '"
-        )
-    return data
-
-
+# ══ 契約自身健檢 ════════════════════════════════════════════════════════
 def check_contract_shape(c: dict[str, Any], source: str, path: Path) -> None:
     """契約自身的健檢。契約寫錯 = 放行機制失效，全部從嚴（02 §十）。"""
     for k in REQUIRED_KEYS:
@@ -1007,14 +980,15 @@ def check_append_only(c: dict[str, Any], snap_path: Path) -> bool:
 
 
 # ══ 報告 ════════════════════════════════════════════════════════════════
-def write_report(path: Path, source: str, contract: Path,
+def write_contract_report(path: Path, source: str, contract: Path,
                  tables: dict[str, ActualTable], code: int) -> None:
     lines = [
         f"# 欄位契約比對報告 — {source}",
         "",
         f"- 產出時間：{datetime.now().isoformat(timespec='seconds')}",
         f"- 契約檔：`{contract}`",
-        f"- 退出碼：{code}（0 通過｜1 有 error 擋住｜2 只有 warning｜3 腳本失敗）",
+        f"- 退出碼：{code}（0 通過｜1 有 error 擋住｜2 只有 warning"
+        f"｜64 用法錯誤｜70 腳本自身異常；見 00 §八）",
         "",
         "## 比對範圍",
         "",
@@ -1039,7 +1013,7 @@ def write_report(path: Path, source: str, contract: Path,
 
 
 # ══ 主流程 ══════════════════════════════════════════════════════════════
-def run(args: argparse.Namespace) -> int:
+def run_contract_check(args: argparse.Namespace) -> int:
     p = project_dir(args.project, create=not args.dry_run)
 
     contract_path = (args.contract if args.contract
@@ -1050,9 +1024,11 @@ def run(args: argparse.Namespace) -> int:
         print(f"     1) 複製範本改欄名："
               f"cp templates/contracts/example.yml \"{contract_path}\"")
         print("     2) 跑 profile_dataset.py 由步驟③ 的剖析結果生草稿，交包子確認後才算數")
-        return 1
+        return EX_ERROR
 
-    c = load_contract(contract_path)
+    # 共用解析（scripts/contract.py）。本檔後續全部以原始 dict 走訪，所以取 .raw；
+    # 解析後的 grain / columns / sentinels 也在同一個物件上，之後要收斂可以逐段換過去。
+    c = load_contract(contract_path).raw
     source = str(c.get("source") or args.source or contract_path.stem)
     check_contract_shape(c, args.source or contract_path.stem, contract_path)
 
@@ -1068,7 +1044,7 @@ def run(args: argparse.Namespace) -> int:
         print(f"   — 掃描位置：{p.raw}（檔名要以 `{source}` 開頭，或放在 "
               f"{p.raw / source}/ 底下）")
         print("     也可以直接指定：--data <路徑> --data <路徑>")
-        return 1
+        return EX_ERROR
 
     encoding = str(c.get("encoding") or "utf-8")
     with connect(args.project) as con:
@@ -1077,7 +1053,7 @@ def run(args: argparse.Namespace) -> int:
             print("⛔ 沒有任何實檔讀得起來，無法比對")
             for m in warnings:
                 print(f"   {m}")
-            return 1
+            return EX_ERROR
 
         print("=" * 70)
         print("行銷數據分析 Skill — 欄位契約比對（M1 步驟②）")
@@ -1133,28 +1109,28 @@ def run(args: argparse.Namespace) -> int:
 
     print("\n" + "=" * 70)
     if errors:
-        code = 1
+        code = EX_ERROR
         print(f"結果：{n_err} 個 error、{n_warn} 個 warning、{n_info} 個 info → 擋住")
         print("      契約不符直接擋住，不浪費時間剖析（04 §一 步驟②）。")
         print(f"      解除方式只有一個：在 {contract_path.name} 明確宣告處理方式後重跑。")
     elif warnings:
-        code = 2
+        code = EX_WARN
         print(f"結果：{n_warn} 個 warning、{n_info} 個 info → 可往下")
         print("      warning 條目要抄進報告的「資料限制」節，不是看過就算。")
     else:
-        code = 0
+        code = EX_OK
         print(f"結果：契約與實檔一致（{n_info} 項 info）→ 可進步驟③ 逐欄剖析")
 
     if not args.no_report and not args.dry_run:
         rp = p.log / f"契約比對__{source}.md"
-        write_report(rp, source, contract_path, tables, code)
+        write_contract_report(rp, source, contract_path, tables, code)
         print(f"\n報告：{rp}")
 
     return code
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(
+    ap = GateArgumentParser(
         description="欄位契約比對（M1 步驟②）：contracts/<source>.yml vs 實檔",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1178,20 +1154,21 @@ def main() -> int:
         args.source = args.contract.stem
 
     try:
-        return run(args)
+        return run_contract_check(args)
     except ContractError as e:
-        # 契約寫壞是「資料側」的問題，不是腳本壞了 → 退出碼 1 而不是 3
+        # 契約寫壞是「資料側」的問題，不是腳本壞了 → 退出碼 1 而不是 70
         print(f"⛔ {e}")
-        return 1
+        return EX_ERROR
     except KeyboardInterrupt:
         print("\n⛔ 使用者中斷")
-        return 3
+        return EX_SOFTWARE
     except Exception as e:                         # noqa: BLE001
         print(f"⛔ 比對腳本本身失敗：{type(e).__name__}: {e}")
-        print("   — 退出碼 3 代表腳本壞了，不是資料壞了。修腳本，不准手動略過（04 §四）")
+        print(f"   — 退出碼 {EX_SOFTWARE} 代表腳本壞了，不是資料壞了。"
+              f"修腳本，不准手動略過（00 §八、04 §四）")
         import traceback
         traceback.print_exc()
-        return 3
+        return EX_SOFTWARE
 
 
 if __name__ == "__main__":

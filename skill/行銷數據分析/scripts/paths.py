@@ -17,6 +17,13 @@
 
 命令列自我檢查：
     python paths.py
+
+退出碼（全庫統一，權威定義見 references/00_通則與紀律.md §八）：
+    0  = 全通過
+    1  = 有 error 擋住（本腳本目前沒有這種情況，路徑解析永遠有預設值）
+    2  = 只有 warning，可往下（同上，本腳本不產生）
+    64 = 用法錯誤（本腳本不吃任何參數，給了就是 64）
+    70 = 腳本自身異常
 """
 
 from __future__ import annotations
@@ -229,6 +236,14 @@ def causal_venv_python() -> Path | None:
 
 
 def _main() -> int:
+    # 在函式內 import：paths.py 是所有腳本的最底層，模組層不吃額外相依
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from exitcodes import EX_OK, GateArgumentParser
+
+    ap = GateArgumentParser(
+        description="路徑解析自我檢查（不吃參數）")
+    ap.parse_args()
+
     print("=" * 62)
     print("行銷數據分析 Skill — 路徑解析")
     print("=" * 62)
@@ -251,8 +266,18 @@ def _main() -> int:
     for d in PROJECT_SUBDIRS:
         print(f"    {d}/")
     print(f"  資料庫檔：{pp.db.name}")
-    return 0
+    return EX_OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(_main())
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from exitcodes import EX_SOFTWARE
+    try:
+        raise SystemExit(_main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"⛔ paths.py 本身失敗：{type(exc).__name__}: {exc}\n"
+              f"   → 退出碼 {EX_SOFTWARE}（腳本自身異常）。修腳本（00 §八）。",
+              file=sys.stderr)
+        raise SystemExit(EX_SOFTWARE) from exc

@@ -2,10 +2,12 @@
 """
 新機器開工前的環境檢查 —— 在別台電腦第一次用這個 Skill 時先跑這支。
 
-三桶輸出 + 退出碼（沿用既有 skill 的慣例）：
-    0 = 全通過
-    1 = 有 error，不能開工
-    2 = 只有 warning，能開工但某些模組不可用
+三桶輸出 + 退出碼（全庫統一，權威定義見 references/00_通則與紀律.md §八）：
+    0  = 全通過
+    1  = 有 error，不能開工
+    2  = 只有 warning，能開工但某些模組不可用
+    64 = 用法錯誤（旗標打錯、缺必填參數）—— 檢查根本沒跑
+    70 = 腳本自身異常 —— 修腳本，不准手動略過
 
 用法：
     python setup_check.py
@@ -14,7 +16,6 @@
 
 from __future__ import annotations
 
-import argparse
 import importlib.util
 import shutil
 import subprocess
@@ -25,6 +26,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paths import (  # noqa: E402
     SKILL_ROOT, CONFIG_FILE, CONFIG_EXAMPLE,
     projects_root, archive_root, causal_venv_python, cfg,
+)
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_SOFTWARE, GateArgumentParser,
 )
 
 if sys.platform == "win32":
@@ -195,6 +199,14 @@ BLOCKING_SCRIPTS: dict[str, str] = {
         "M1 三桶 + exit code，是 M1→M2 唯一的放行機制（04 §一）",
     "db.py":
         "唯一合法的連線介面，03 §7.1 明訂禁止各自 duckdb.connect()",
+    "exitcodes.py":
+        "全庫退出碼公約（00 §八）的唯一實作。scripts/ 每一支都 import 它，"
+        "缺了全部 import 失敗；而且用法錯誤會退回 argparse 預設的 2，"
+        "跟「只有 warning，可往下」撞在一起，驅動腳本會 fail open",
+    "contract.py":
+        "contracts/<source>.yml 的唯一解析實作（02 §十）。check_data_quality.py 與 "
+        "check_schema_contract.py 都 import 它，缺了兩支都 import 失敗；"
+        "各自解析會讓契約 schema 一改就兩邊分岔，而且兩邊都不報錯",
     "stats_utils.py":
         "唯一合法的 type-III ANOVA/EMM（08 §121、16 §249）；"
         "直接呼叫 anova_lm(typ=3) 會靜默算錯",
@@ -354,7 +366,7 @@ def check_fonts() -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="新機器環境檢查")
+    ap = GateArgumentParser(description="新機器環境檢查")
     ap.add_argument("--verbose", action="store_true", help="連通過項也列出")
     args = ap.parse_args()
 
@@ -395,13 +407,21 @@ def main() -> int:
     n_warn = sum(1 for m in warnings if not m.startswith("    "))
     if errors:
         print(f"結果：{n_err} 個 error、{n_warn} 個 warning → 不能開工")
-        return 1
+        return EX_ERROR
     if warnings:
         print(f"結果：{n_warn} 個 warning → 可以開工，部分模組不可用")
-        return 2
+        return EX_WARN
     print(f"結果：全部通過（{len(infos)} 項）→ 可以開工")
-    return 0
+    return EX_OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"⛔ setup_check.py 本身失敗：{type(exc).__name__}: {exc}\n"
+              f"   → 退出碼 {EX_SOFTWARE}（腳本自身異常），不是環境有問題。"
+              f"修腳本，不准手動略過（00 §八）。", file=sys.stderr)
+        raise SystemExit(EX_SOFTWARE) from exc

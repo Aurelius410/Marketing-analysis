@@ -14,6 +14,28 @@
 # ⚠ 契約只能 append。改了 grain、刪了 renames 的舊鍵，半年前那份報告就重跑不出來
 #    （02 §十 末段、02 §九 DDL append-only 同一條理由）。
 #    check_schema_contract.py 會把 grain 與 renames 存快照，下次偷改直接擋。
+#
+# ── 複製後要改哪幾個欄位才能用 ─────────────────────────────────────────
+#   1. 檔名 —— 必改。`<你的來源代號>.yml`，且要與下面的 `source:` 完全同字串。
+#   2. source / encoding / source_tz —— 必改。encoding 去看匯出端實際設定，不准留 utf-8
+#      靠猜（台灣 POS/CRM 大量是 big5）。
+#   3. grain —— 必改。表名 = 檔名去掉 `<source>__` 前綴。表名對不上，grain 唯一性
+#      就整段跳過不驗。
+#   4. columns —— 必改。整段換成你自己的欄位；五個鍵（name/dtype/unit/nullable/
+#      practical_use）缺一不可，practical_use 填不出來代表這欄還沒想清楚。
+#   5. enum_domains —— 有類別欄就必填。沒有類別欄就整段刪掉（留空 `{}` 也可以）。
+#   6. renames / sentinels / quality_overrides —— **預設要清空**。本範本裡的三筆
+#      （step2_interval.int=9999、cards.信用額度=0、Q2/Q5 override）是台大信用卡
+#      資料集的實例，照抄到別的來源等於替不存在的問題預先放行。decided_by 是「包子」
+#      也要改成實際決策者。
+#   ⚠ 不改就照抄的話，check_schema_contract.py 會把你的實檔全部報成「契約沒有這一欄」。
+#
+# ── 拿本範本原封不動跑通的方式（回歸測試用）───────────────────────────
+#   cp templates/contracts/example.yml <專案>/原始資料/contracts/ntu_creditcard.yml
+#   把 samples/ 的 ntu_creditcard__{transactions,customers,step5_cai}.parquet
+#   放進 <專案>/原始資料/，再跑 check_schema_contract.py <專案> --source ntu_creditcard
+#   → 預期 exit 2（7 個 warning，全是 DATE vs TIMESTAMP_NS 與 DECIMAL vs DOUBLE 的
+#     型別族差異，不是契約寫錯）。
 # ═══════════════════════════════════════════════════════════════════════
 
 # ── 必填四鍵 ───────────────────────────────────────────────────────────

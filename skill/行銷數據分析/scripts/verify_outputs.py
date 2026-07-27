@@ -13,10 +13,13 @@
     · 學生J 把 CAI 寫成 Category Expansion Index（18-E6）
   這些都是「人眼看得到但沒人會每次看」的錯誤 —— 正是該交給機器的那一類。
 
-退出碼（沿用 20 §九）：
-    0 = 全綠，可交付
-    1 = 有 error，**不得輸出**。回去修，不要用「先寄一版」繞過
-    2 = 僅 warning，可交付，但每一條都要在《進度與異狀.md》登錄並配一條處理
+退出碼（全庫統一，權威定義見 00 §八；交付側的下游行為見 20 §九）：
+    0  = 全綠，可交付
+    1  = 有 error，**不得輸出**。回去修，不要用「先寄一版」繞過
+    2  = 僅 warning，可交付，但每一條都要在《進度與異狀.md》登錄並配一條處理
+    64 = 用法錯誤（旗標打錯、沒給專案代號也沒給 --self-check、--only 把檢查篩光）
+         → 驗收根本沒跑，不得當成「只有 warning」放行
+    70 = 腳本自身異常
 
 用法：
     python verify_outputs.py 2026Q3_電商
@@ -26,7 +29,15 @@
     python verify_outputs.py 2026Q3_電商 --only R         # 跑整個 R 分類
     python verify_outputs.py 2026Q3_電商 --verbose        # 連通過項也列出
     python verify_outputs.py 2026Q3_電商 --json 結果.json # 另存機器可讀結果
-    python verify_outputs.py --static-only                # 只跑不需要專案的靜態檢查
+    python verify_outputs.py --self-check                 # 只檢查 skill 自身（R01/R02/F04）
+
+兩種模式，退出碼各自獨立（不要混）：
+    · **專案模式**（給了專案代號）：只驗這個專案的交付物。R01／R02 這種「檢查 skill
+      自身」的規則**不會跑** —— skill 自己的文件寫錯，不該讓某個專案的交付被判 error。
+      真要一起跑就加 `--include-self-check`，或 `--only R01` 點名。
+    · **自檢模式**（`--self-check`）：只跑 R01／R02／F04，掃 `--scan-root`（預設 SKILL_ROOT）。
+      這是 skill 自己的 CI 該跑的，不是交付 gate。
+`--static-only` 保留為 `--self-check` 的舊名。
 
 ── 這支腳本讀什麼（交付物層的輸入契約）────────────────────────────
     交付物/完整報告.html            11 章骨架、排版件、數字 token
@@ -35,7 +46,8 @@
     交付物/sizing.csv               14 §三，每條建議一列
     交付物/action_brief_<rec>.md    14 §五，一頁一策略
     圖表/報告用/manifest.json       collect_figures.py 產出（含 sha256、口徑）
-    統計表/**/*.csv                 utf-8-sig，最後一欄中文結論
+    統計表/<交付用類>/*.csv         utf-8-sig，最後一欄中文結論
+                                    （QA 中繼產物那三類不掃，見 QA_TABLE_DIRS）
     模型輸出/bundle.json            result_bundle.py 匯出的 Result 表
     模型輸出/analysis_objects.json  ANOVA／事後檢定／分群輸入／證據檢查物件索引
     專案記憶/指標字典.csv           dim_metric_definition（18-G10）
@@ -47,14 +59,14 @@ schema（result_bundle.py / collect_figures.py / stamp_version.py 都還沒實�
 上表的檔名與欄位是本腳本訂的契約，那三支腳本實作時要對齊；schema 不合會報成
 「缺檔／欄位不符」而不是靜默跳過。
 
-【此處為實作判斷】14 §九 的 M11_ARTIFACTS 用了編號式英文目錄，與 03 §1.2
-「這份 skill 裡不存在編號式英文目錄」直接衝突。本腳本一律走 `交付物/`，
-並由 R01 把 14 §九 那 12 處硬編路徑掃出來報成 error —— 不默默吞掉。
+【此處為實作判斷】本腳本一律走 `交付物/`（03 §1.2）。R01 仍然會把 references／腳本裡
+殘留的編號式英文目錄掃出來報成 error，但**只在自檢模式**跑 —— skill 自身的文件問題
+是 skill 的 CI 該擋的，不是某個專案交付與否的判準。
 """
 
 from __future__ import annotations
 
-import argparse
+import ast
 import csv
 import hashlib
 import io
@@ -66,6 +78,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_USAGE, EX_SOFTWARE, GateArgumentParser,
+)
 from paths import SKILL_ROOT, ProjectPaths, projects_root  # noqa: E402
 
 if sys.platform == "win32":
@@ -189,6 +204,20 @@ PCT_HEADER_HINTS = ("%", "百分比", "比例", "pct")
 PCT_HEADER_EXCLUDE = ("累積", "累计", "cum", "變化", "增減", "成長", "差異",
                       "反應率", "轉換率", "留存率", "命中率", "誤差")
 
+# 19 §5.5（本腳本提案、已回寫 reference）：`統計表/` 的七類裡有兩種東西 ——
+#   · **交付用表**：進報告的表，受 T03/T04/T05/T06/T07/C01~C04 全套排版與符號紀律管。
+#   · **QA 中繼產物**：上游腳本自己寫的機器讀取檔，是 gate 的資料來源，不是報告用表。
+# 下面三類是 QA 中繼產物，交付 gate 一律不掃：
+#   資料體檢/      check_data_quality.py 的三桶結果。母數／占比／實例三欄對非比率型
+#                  規則本來就是空的（C01 誤擋 20 次）；占比欄是 0–1 的比率不是百分比
+#                  （T03 誤判成「加總 0.09、偏離 100 達 99.91」）。
+#   轉換前後對照/  pick_transform.py / prep_cluster_matrix.py 的方法選用與偏度對照。
+#   分群輪廓/      prep_cluster_matrix.py 的 WGSS 貢獻表（gate3 的資料來源）。
+# 這三類要進報告，就由產表腳本另存一份到 行銷分析/ 或 迴歸與診斷/ 等交付用類，
+# 排版與結論欄在那一次補齊 —— 不是把中繼檔直接當報告表。
+# 要把它們也掃進來（debug 用）加 `--include-qa-tables`。
+QA_TABLE_DIRS: set[str] = {"資料體檢", "轉換前後對照", "分群輪廓"}
+
 # 03 §1.2：references 與腳本裡不得出現的編號式英文目錄
 NUMBERED_DIR_RE = re.compile(r"\b(\d{2}_[A-Za-z][A-Za-z0-9_\-]*)/")
 # 03 §1.2 管的是「專案樹」的目錄命名。repo 自己的頂層資料夾（00_source_archive、
@@ -266,6 +295,8 @@ class Ctx:
     p: ProjectPaths | None
     scan_root: Path
     rep: Report
+    self_check: bool = False        # 自檢模式：掃 skill 自身，不是專案交付物
+    include_qa_tables: bool = False  # 把 QA 中繼產物也當交付表掃（debug 用）
     _cache: dict[str, Any] = field(default_factory=dict)
 
     # ── 小工具 ────────────────────────────────────────────
@@ -321,9 +352,21 @@ class Ctx:
                               "stamp_version.py（20 §十）")
 
     def stat_tables(self) -> list[Path]:
+        """**交付用**統計表。QA 中繼產物那三類不在內（見 QA_TABLE_DIRS）。"""
         if "tables" not in self._cache:
-            self._cache["tables"] = sorted(self.p.tables.rglob("*.csv"))
+            found = sorted(self.p.tables.rglob("*.csv"))
+            if not self.include_qa_tables:
+                found = [f for f in found if not self.is_qa_table(f)]
+            self._cache["tables"] = found
         return self._cache["tables"]
+
+    def is_qa_table(self, path: Path) -> bool:
+        """落在 統計表/{資料體檢,轉換前後對照,分群輪廓}/ 底下的都算 QA 中繼產物。"""
+        try:
+            parts = path.relative_to(self.p.tables).parts[:-1]
+        except ValueError:
+            return False
+        return bool(set(parts) & QA_TABLE_DIRS)
 
     def text_deliverables(self) -> list[Path]:
         """可讀成純文字的交付檔。"""
@@ -1290,7 +1333,11 @@ def chk_F03_figure_naming(c: Ctx) -> None:
 
 def chk_F04_forbidden_code(c: Ctx) -> None:
     """產圖程式碼層的禁用寫法（雙 Y 軸／圓餅／3D／雷達／文字雲）（19 §4.3）"""
-    roots = [c.scan_root]
+    # 專案模式只掃專案自己的 .py —— skill 內建腳本的寫法是自檢模式的事，
+    # 不該讓某個專案的交付被 skill 自身的程式碼判 error（與 R01/R02 同一條原則）。
+    roots: list[Path] = []
+    if c.self_check:
+        roots.append(c.scan_root)
     if c.p is not None and c.p.root.exists():
         roots.append(c.p.root)
     seen: set[tuple[str, int]] = set()
@@ -1312,7 +1359,8 @@ def chk_F04_forbidden_code(c: Ctx) -> None:
                                   str(f))
 
 
-# ── 靜態規範（03 §1.2）─────────────────────────────────
+# ── 自檢規範（03 §1.2）─────────────────────────────────
+#    這一段檢查的是 **skill 自己**，不是任何專案的交付物。只在自檢模式跑。
 
 def chk_R01_numbered_dirs(c: Ctx) -> None:
     """references 與腳本裡不得出現 `0N_英文名/` 形式的硬編路徑（03 §1.2）"""
@@ -1341,20 +1389,70 @@ def chk_R01_numbered_dirs(c: Ctx) -> None:
                           str(f))
 
 
-def chk_R02_hardcoded_paths(c: Ctx) -> None:
-    """腳本不得寫死絕對路徑，也不得自己 duckdb.connect()（03 §1.2、§7.1）"""
-    for f in sorted((c.scan_root / "scripts").rglob("*.py")) if (c.scan_root / "scripts").exists() else []:
-        if "__pycache__" in f.parts or f.name in {"paths.py", "db.py", Path(__file__).name}:
-            continue
-        for ln, line in enumerate(read_text(f).splitlines(), 1):
-            if line.lstrip().startswith("#"):
+ABS_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+# db.connect() 是唯一合法介面，所以這兩支不受管；本腳本自己談的是規則不是實作。
+R02_EXEMPT_FILES = {"paths.py", "db.py"}
+
+
+def _docstring_nodes(tree: ast.Module) -> set[int]:
+    """收集所有 docstring 的 id()。文件裡舉例的路徑不是寫死路徑。"""
+    out: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef,
+                             ast.FunctionDef, ast.AsyncFunctionDef)):
+            doc = ast.get_docstring(node, clean=False)
+            if doc is None:
                 continue
-            if re.search(r"['\"][A-Za-z]:[\\/]", line):
-                c.rep.add("R02", "warning", f"{f.name}:{ln} 寫死了絕對路徑",
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                out.add(id(first.value))
+    return out
+
+
+def chk_R02_hardcoded_paths(c: Ctx) -> None:
+    """腳本不得寫死絕對路徑，也不得自己 duckdb.connect()（03 §1.2、§7.1）
+
+    【此處為實作判斷】用 `ast` 解析，不用逐行 regex。
+    逐行 regex 只跳得掉「整行註解」，跳不掉行尾註解、字串常數與 docstring ——
+    實測回報的三處 duckdb.connect() 全是誤報：
+      · profile_dataset.py  `from db import connect  # …不准自己 duckdb.connect()`（行尾註解）
+      · setup_check.py      BLOCKING_SCRIPTS dict 裡的說明字串
+      · setup_check.py      `duckdb.connect()` 無參數 ＝ in-memory 探測，不碰任何倉儲檔
+    AST 只看真實的 Call 節點，前兩者根本不是節點；第三者無參數，另行豁免。
+    """
+    scripts_dir = c.scan_root / "scripts"
+    if not scripts_dir.exists():
+        return
+    for f in sorted(scripts_dir.rglob("*.py")):
+        if "__pycache__" in f.parts or f.name in R02_EXEMPT_FILES or f.name == Path(__file__).name:
+            continue
+        src = read_text(f)
+        try:
+            tree = ast.parse(src, filename=str(f))
+        except SyntaxError as e:
+            c.rep.add("R02", "error", f"{f.name}:{e.lineno} 語法錯誤，無法解析（{e.msg}）",
+                      "先把這支腳本改到 `python -m py_compile` 過得去，R02 才驗得了",
+                      str(f))
+            continue
+        docstrings = _docstring_nodes(tree)
+        for node in ast.walk(tree):
+            # ① 寫死的絕對路徑（只看真的字串常數，不看註解、不看 docstring）
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docstrings
+                    and ABS_PATH_RE.match(node.value)):
+                c.rep.add("R02", "warning",
+                          f"{f.name}:{node.lineno} 寫死了絕對路徑 {node.value!r}",
                           "改用 `from paths import project_dir, cfg`；"
                           "寫死路徑的 skill 換一台機器就不能用（03 §1.2）", str(f))
-            if re.search(r"\bduckdb\.connect\s*\(", line):
-                c.rep.add("R02", "warning", f"{f.name}:{ln} 直接呼叫 duckdb.connect()",
+            # ② 自己開 duckdb 連線
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "connect"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "duckdb"):
+                if not node.args and not node.keywords:
+                    continue          # duckdb.connect() ＝ in-memory 探測，不碰倉儲檔
+                c.rep.add("R02", "warning",
+                          f"{f.name}:{node.lineno} 直接呼叫 duckdb.connect()",
                           "一律走 `from db import connect` —— encodings 擴充、記憶體上限、"
                           "唯讀旗標都在那一層（03 §7.1、18-T9）", str(f))
 
@@ -1450,6 +1548,9 @@ class Check:
     source: str
     fn: Callable[[Ctx], None]
     needs_project: bool = True
+    # 檢查的是 **skill 自身**（references／內建腳本），不是專案交付物。
+    # 專案模式一律不跑 —— skill 的文件寫錯不該判某個專案的交付 error。
+    self_only: bool = False
 
 
 CHECKS: list[Check] = [
@@ -1491,8 +1592,8 @@ CHECKS: list[Check] = [
     Check("F03", "圖表", "圖檔命名與圖種詞彙表合規", "19 §6.1", chk_F03_figure_naming),
     Check("F04", "圖表", "產圖程式碼無禁用寫法", "19 §4.3", chk_F04_forbidden_code, False),
 
-    Check("R01", "靜態", "無編號式英文目錄硬編路徑", "03 §1.2", chk_R01_numbered_dirs, False),
-    Check("R02", "靜態", "腳本無寫死絕對路徑／自建 duckdb 連線", "03 §1.2、§7.1", chk_R02_hardcoded_paths, False),
+    Check("R01", "自檢", "無編號式英文目錄硬編路徑", "03 §1.2", chk_R01_numbered_dirs, False, True),
+    Check("R02", "自檢", "腳本無寫死絕對路徑／自建 duckdb 連線", "03 §1.2、§7.1", chk_R02_hardcoded_paths, False, True),
 
     Check("M01", "建議", "M11 產出物齊備", "14 §九", chk_M01_artifacts),
     Check("M02", "建議", "跨章洞察 3–5 條且各引用 ≥2 章", "14 §二", chk_M02_insights),
@@ -1532,24 +1633,36 @@ def print_list() -> int:
         if c.category != cat:
             cat = c.category
             print(f"\n[{cat}]")
-        star = "" if c.needs_project else "  （不需專案，可用 --static-only）"
+        if c.self_only:
+            star = "  （檢查 skill 自身，只在 --self-check 跑）"
+        elif not c.needs_project:
+            star = "  （不需專案，--self-check 也會跑）"
+        else:
+            star = ""
         print(f"  {c.id}  {c.title}")
         print(f"        出處：{c.source}{star}")
     print()
-    return 0
+    return EX_OK
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="交付 gate：產出前的機械化驗收（0 可交付／1 不得輸出／2 有警告）")
-    ap.add_argument("專案代號", nargs="?", help="要驗收的專案代號")
+    ap = GateArgumentParser(
+        description="交付 gate：產出前的機械化驗收"
+                    "（0 可交付／1 不得輸出／2 有警告／64 用法錯誤／70 腳本異常）")
+    ap.add_argument("project", metavar="專案代號", nargs="?",
+                    help="要驗收的專案代號")
     ap.add_argument("--only", help="只跑這幾條，逗號分隔（代號／分類／首字母）")
     ap.add_argument("--skip", help="跳過這幾條，逗號分隔")
     ap.add_argument("--list", action="store_true", help="列出所有檢查後結束")
-    ap.add_argument("--static-only", action="store_true",
-                    help="只跑不需要專案的靜態檢查（R01/R02/F04）")
+    ap.add_argument("--self-check", "--static-only", dest="self_check",
+                    action="store_true",
+                    help="自檢模式：只檢查 skill 自身（R01/R02/F04），不需專案")
+    ap.add_argument("--include-self-check", action="store_true",
+                    help="專案模式下連自檢規則（R01/R02）一起跑（預設不跑）")
+    ap.add_argument("--include-qa-tables", action="store_true",
+                    help="把 統計表/{資料體檢,轉換前後對照,分群輪廓}/ 也當交付表掃（debug 用）")
     ap.add_argument("--scan-root", type=Path, default=SKILL_ROOT,
-                    help=f"靜態掃描的根目錄，預設 {SKILL_ROOT}")
+                    help=f"自檢掃描的根目錄，預設 {SKILL_ROOT}")
     ap.add_argument("--verbose", action="store_true", help="連通過的檢查也列出")
     ap.add_argument("--json", type=Path, help="把結果另存成 JSON")
     args = ap.parse_args()
@@ -1557,17 +1670,25 @@ def main() -> int:
     if args.list:
         return print_list()
 
-    project = getattr(args, "專案代號")
-    if not project and not args.static_only:
-        ap.error("要指定專案代號，或用 --static-only 只跑靜態檢查")
+    project = args.project
+    if not project and not args.self_check:
+        ap.error("要指定專案代號，或用 --self-check 只檢查 skill 自身")
 
     picked = select_checks(args.only, args.skip)
-    if args.static_only:
+    named = {s.strip().upper() for s in (args.only or "").split(",") if s.strip()}
+    dropped: list[Check] = []
+    if args.self_check:
         picked = [c for c in picked if not c.needs_project]
+    else:
+        # 專案模式：自檢規則不參與判定，除非明確點名或 --include-self-check
+        dropped = [c for c in picked if c.self_only
+                   and not args.include_self_check and c.id.upper() not in named]
+        picked = [c for c in picked if c not in dropped]
     if not picked:
+        # 篩光是命令列給錯，不是驗收失敗 → 64（00 §八）
         print("⛔ --only / --skip 的組合把所有檢查都篩掉了 — "
               "用 --list 看有哪些代號")
-        return 1
+        return EX_USAGE
 
     rep = Report()
     pp: ProjectPaths | None = None
@@ -1576,17 +1697,27 @@ def main() -> int:
         if not root.exists():
             print(f"⛔ 找不到專案目錄：{root}")
             print(f"   — 確認專案代號是否打錯，或先跑過建倉流程（M3）建立它")
-            return 1
+            return EX_ERROR
         pp = ProjectPaths(root)
 
-    ctx = Ctx(project=project or "(靜態)", p=pp, scan_root=args.scan_root, rep=rep)
+    ctx = Ctx(project=project or "(自檢)", p=pp, scan_root=args.scan_root, rep=rep,
+              self_check=args.self_check, include_qa_tables=args.include_qa_tables)
 
     print("=" * 72)
-    print("行銷數據分析 Skill — 交付 gate")
-    print(f"專案：{ctx.project}")
-    if pp:
-        print(f"路徑：{pp.root}")
-    print(f"靜態掃描根目錄：{args.scan_root}")
+    if args.self_check:
+        print("行銷數據分析 Skill — 自檢（檢查 skill 自身，不是交付 gate）")
+        print(f"掃描根目錄：{args.scan_root}")
+    else:
+        print("行銷數據分析 Skill — 交付 gate")
+        print(f"專案：{ctx.project}")
+        if pp:
+            print(f"路徑：{pp.root}")
+        if dropped:
+            rep.skipped += [c.id for c in dropped]
+            print(f"自檢規則不參與專案判定（{'／'.join(c.id for c in dropped)}）"
+                  f"；要跑用 `--self-check`")
+        if args.include_qa_tables:
+            print("⚠ --include-qa-tables：QA 中繼產物也當交付表掃，會有預期內的誤報")
     print(f"本次執行 {len(picked)} / {len(CHECKS)} 條檢查")
     print("=" * 72)
 
@@ -1637,16 +1768,35 @@ def main() -> int:
 
     print("\n" + "=" * 72)
     if n_err:
-        print(f"結果：{n_err} 個 error、{n_warn} 個 warning → ⛔ 不得輸出")
-        print("      回去修，不要用「先寄一版」繞過（20 §九）")
-        return 1
+        if args.self_check:
+            print(f"結果：{n_err} 個 error、{n_warn} 個 warning → ⛔ skill 自身不合規")
+            print("      這是 skill 的 CI，不是某個專案的交付判定")
+        else:
+            print(f"結果：{n_err} 個 error、{n_warn} 個 warning → ⛔ 不得輸出")
+            print("      回去修，不要用「先寄一版」繞過（20 §九）")
+        return EX_ERROR
     if n_warn:
-        print(f"結果：{n_warn} 個 warning → ⚠ 可交付，但要登錄《進度與異狀.md》")
-        return 2
+        if args.self_check:
+            print(f"結果：{n_warn} 個 warning → ⚠ skill 自身可用，但有待辦")
+        else:
+            print(f"結果：{n_warn} 個 warning → ⚠ 可交付，但要登錄《進度與異狀.md》")
+        return EX_WARN
+    if args.self_check:
+        print(f"結果：{len(rep.ran)} 條檢查全綠 → ✅ skill 自身合規")
+        return EX_OK
     print(f"結果：{len(rep.ran)} 條檢查全綠 → ✅ 可交付")
     print("      交付時用 [View 檔名](computer://…) 給連結（00 §六）")
-    return 0
+    return EX_OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"⛔ verify_outputs.py 本身失敗：{type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        print(f"   → 退出碼 {EX_SOFTWARE}（腳本自身異常）。修腳本（00 §八）。",
+              file=sys.stderr)
+        raise SystemExit(EX_SOFTWARE) from exc

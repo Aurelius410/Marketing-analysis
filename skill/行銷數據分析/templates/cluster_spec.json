@@ -1,30 +1,60 @@
 {
   "_說明": "M6 分群的規格檔，存到 projects/<代號>/模型輸出/cluster_spec.json。三件事：(1) 讓換一批資料重跑時用同一組決策；(2) 提供 verify_outputs.py 的 S1 gate 資料來源（input_vars）；(3) transform/scaler/distance 任一為 none 時，報告必須寫理由。規格見 references/07_標籤與分群.md §3.3。",
 
-  "input_vars": ["r_days_since_last_sale", "ln_f", "ln_m", "cai", "cri"],
+  "_複製後必改的欄位": [
+    "input_vars —— 必改。改成你自己那張特徵表真正有的欄名（見下方 _欄名對照）。本範本的預設值是 build_features.py 的實際產出欄名，接得上就可以不動。",
+    "cri_prior_type —— 只有把 cri 放進 input_vars 時才必填，且只有 \"behavioral\" 進得了矩陣。預設 null ＝「沒有用 CRI」。",
+    "k —— 先留 null。07 §五（手肘／Gap／CH／輪廓）決定之後才回填；prep_cluster_matrix.py 在 k 為 null 時會暫定 4 只為了算 WGSS 貢獻與 ARI，那不是你的 k。",
+    "anova_tested_vars —— M6 §八 跑完 ANOVA 才回填。與 input_vars 有交集就是循環推論，verify_outputs.py 會擋。",
+    "scaler / distance / algorithm / seed / n_init —— 依 06 §5.2、07 §3.3 的裁定調整；預設值（zscore／euclidean／kmeans／42／10）對行為指標矩陣就是對的，改了才要寫理由。",
+    "preflight / validation —— 不用手填。preflight gate1–3 由 prep_cluster_matrix.py 回填，gate4–5 與 validation 由 M6 後段的腳本或人工回填。"
+  ],
+
+  "input_vars": ["r_days_since_last_sale", "f_txn_cnt", "m_net_twd", "cai"],
   "_input_vars_白名單": "只准 R / F / M / RFM Score / CAI / CRI / 因素分數 / LN_F / LN_M（18-E2）。人口統計變數一律禁止，它們只出現在卡方那一章。",
+  "_欄名對照": {
+    "_前言": "07 §3.1 的白名單寫的是學名（R/F/M/LN_F/LN_M），build_features.py 產出的是下面這些實際欄名。填 input_vars 要填實際欄名，不是學名。",
+    "R": "r_days_since_last_sale",
+    "F": "f_txn_cnt",
+    "M": "m_net_twd",
+    "RFM Score": "rfm_score（另有 bs_total 等 Bob Stone 變體）",
+    "CAI": "cai（同時需要 interval_cnt 欄；n_intervals < 5 的 CAI 會被置為 N/A）",
+    "CRI": "cri（要先過血緣檢查，見 cri_prior_type）",
+    "LN_F / LN_M": "不要自己填。log1p 是 prep_cluster_matrix.py 在 |skew| > 1 時自己做的，產出欄名是 f_txn_cnt__log1p / m_net_twd__log1p，只出現在 cluster_matrix.parquet 裡，不在特徵表裡。把 ln_f / ln_m 寫進 input_vars 會直接因為「輸入資料缺少欄位」擋下來。"
+  },
+
+  "cri_prior_type": null,
+  "_cri_prior_type_合法值": {
+    "_出處": "scripts/demographic_vars.py 的 PRIOR_TYPES。除了 null 之外只能填這四個字串。",
+    "null": "還沒判定，或 input_vars 根本不含 cri。血緣檢查在 input_vars 不含 cri 時會標「不適用」並放行；含 cri 而這裡是 null 就 error。",
+    "behavioral": "先驗群用行為分層切的（例：F 三分位、品類廣度、購買週期分層）。唯一能讓 cri 進矩陣的值。",
+    "demographic": "先驗群全部用人口變數切的（例：build_features.py --prior-group-cols 性別）。誠實填這個，然後把 cri 從 input_vars 拿掉 —— prep_cluster_matrix.py 會擋下來，這是刻意的。",
+    "mixed": "先驗群一部分是人口變數、一部分不是。與 demographic 同樣不得進矩陣：只要有一欄是人口變數，污染就已經發生。",
+    "none": "根本沒有先驗分群層（build_features.py 沒給 --dim／--prior-group-cols），cri 全欄是 N/A。這種情況 cri 不可能進矩陣，input_vars 不要放它。"
+  },
+  "_cri_prior_type_填寫指引": "看你跑 build_features.py 時 --prior-group-cols 給了什麼欄位：給的是行為欄就填 behavioral，給的是性別／年齡／居住地／教育程度／職業／會員等級這類人口欄就填 demographic。理由：CRI 的分母含該顧客所屬先驗群的群內變異數 τ²_g，先驗群用人口變數分時，交易紀錄完全相同的兩人會因人口欄不同拿到不同 CRI（同一個 s²/n 下差到 21.4 vs 79.1），等於把人口變數以非線性編碼偷渡進矩陣（07 §3.1）。另外 07 §8.4 排除條款：先驗群用到的那批欄位也不得進卡方表。",
 
   "transform": {
-    "r_days_since_last_sale": "none",
-    "ln_f": "log1p",
-    "ln_m": "log1p",
-    "cai": "none",
-    "cri": "none"
+    "r_days_since_last_sale": "auto",
+    "f_txn_cnt": "auto",
+    "m_net_twd": "auto",
+    "cai": "auto"
   },
-  "_transform_規則": "skew > 1 才轉換（M4 三門檻）。CAI 可正可負，不可 log。轉換後複檢排序相關 > 0.95。順位表見 06_前處理與轉換.md §1.2。",
+  "_transform_誰在用": "這一段是**紀錄**，不是輸入。prep_cluster_matrix.py 不讀它 —— 它自己量偏度再依白名單類別決定轉換法，結果寫進 模型輸出/scaler.json 與 統計表/轉換前後對照/。跑完把 scaler.json 裡各欄的 method 抄回這裡（none / log1p / ntile5），留 \"auto\" 代表還沒跑過。要凍結決策換批資料重跑，用 --reuse-scaler 指 scaler.json，不要靠改這一段。",
+  "_transform_規則": "skew > 1 才轉換（M4 三門檻）。F/M 走 log1p；R 是時間型、CAI/CRI 可正可負，兩者都只能 NTILE(5) 分位分箱，不可 log。轉換後複檢排序相關 > 0.95。順位表見 06_前處理與轉換.md §1.2、§六。",
 
   "scaler": "zscore",
   "scaler_path": "模型輸出/scaler.json",
-  "_scaler_規則": "非監督在整個分析集上 fit（沒有 train/test 概念）。有離群且已走完 06 §三 → robust。none 要寫理由。",
+  "_scaler_規則": "非監督在整個分析集上 fit（沒有 train/test 概念）。有離群且已走完 06 §三 → robust。none 要寫理由；但尺度比 > 10 時 none 是禁行不是警告，prep_cluster_matrix.py 直接 exit 1。",
 
   "distance": "euclidean",
   "_distance_規則": "白名單全是低維連續行為指標，預設 euclidean。品類佔比 → cosine；購買清單 0/1 → jaccard。",
 
   "algorithm": "kmeans",
-  "k": 4,
+  "k": null,
   "seed": 42,
   "n_init": 10,
-  "_k_理由": "寫在 params.yml 的 k 段（四欄：值／理由／出處／敏感度）。此處只記結果，理由不重複兩份。",
+  "_k_理由": "寫在 params.yml 的 k 段（四欄：值／理由／出處／敏感度）。此處只記結果，理由不重複兩份。k 為 null 時 prep_cluster_matrix.py 暫定 4，僅供 WGSS 貢獻與 ARI 計算。",
 
   "preflight": {
     "gate1_scale_ratio": null,
@@ -38,7 +68,7 @@
     "gate5_within_dist_ratio": null,
     "gate5_pass": null
   },
-  "_preflight_說明": "gate1–3 事前可驗，gate4–5 只能 fit 之後驗。gate4/5 未過要在報告誠實寫明，並用 §六 的 HDBSCAN 交叉比對補強。",
+  "_preflight_說明": "gate1–3 事前可驗，由 prep_cluster_matrix.py 自動回填，不要手填。gate4–5 只能 fit 之後驗。gate4/5 未過要在報告誠實寫明，並用 §六 的 HDBSCAN 交叉比對補強。",
 
   "validation": {
     "silhouette_mean": null,

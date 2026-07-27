@@ -23,12 +23,18 @@
 用法：
     python retransform.py <專案代號>
         掃描 顧客特徵表/transform_spec.json，檢查每個轉換欄位的反轉換風險。
-        三桶輸出 + 退出碼：0 = 全通過、1 = 有 error 不准交付、2 = 有 warning。
 
-    python retransform.py <專案代號> --demo
+    python retransform.py <專案代號> --self-test
         內建自我測試：造一組右偏資料，把「直接 exp」「Duan smearing」「真實算術平均」
         三個數字並排印出來，證明直接 exp 系統性低估。找得到素材庫時一併用
         課程資料集（7,764 筆真實交易）實跑一次。
+
+退出碼（全庫統一，權威定義見 00 §八）：
+    0  = 全通過
+    1  = 有 error，不准交付
+    2  = 只有 warning，可往下但報告要寫明口徑
+    64 = 用法錯誤（旗標打錯、缺專案代號）
+    70 = 腳本自身異常
 
 當函式庫用：
     from retransform import duan_smearing, safe_inverse, check_retransform_risk
@@ -48,7 +54,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 import unicodedata
@@ -60,6 +65,9 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_SOFTWARE, GateArgumentParser,
+)
 from paths import archive_root, project_dir  # noqa: E402
 
 if sys.platform == "win32":
@@ -533,8 +541,8 @@ class RiskReport:
     @property
     def exit_code(self) -> int:
         if self.errors:
-            return 1
-        return 2 if self.warnings_ else 0
+            return EX_ERROR
+        return EX_WARN if self.warnings_ else EX_OK
 
     def print_report(self, out=None) -> None:
         out = out or sys.stdout
@@ -792,7 +800,7 @@ def cmd_scan(project: str) -> tuple[list[str], list[str], list[str]]:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 六、CLI ②：--demo 自我測試
+# 六、CLI ②：--self-test 自我測試
 # ══════════════════════════════════════════════════════════════════
 
 def _line(title: str) -> None:
@@ -1083,10 +1091,13 @@ def demo(errors: list[str], warns: list[str], infos: list[str]) -> None:
 # ══════════════════════════════════════════════════════════════════
 
 def main() -> int:
-    ap = argparse.ArgumentParser(
+    ap = GateArgumentParser(
         description="反轉換工具：擋住 exp(E[log Y]) 被當成 E[Y] 報出去（06 §二）")
-    ap.add_argument("專案代號", help="專案代號，路徑由 paths.project_dir 解析")
-    ap.add_argument("--demo", action="store_true",
+    # --self-test 不寫任何檔案，允許省略專案代號（自我測試旗標全庫統一，00 §八）
+    ap.add_argument("project", metavar="專案代號", nargs="?",
+                    help="專案代號，路徑由 paths.project_dir 解析。"
+                         "--self-test 時可省略")
+    ap.add_argument("--self-test", action="store_true",
                     help="跑內建自我測試：三個數字並排證明直接 exp 低估")
     args = ap.parse_args()
 
@@ -1098,15 +1109,18 @@ def main() -> int:
     warns: list[str] = []
     infos: list[str] = []
 
-    if args.demo:
-        print(f"（--demo 自我測試；專案代號 {args.專案代號} 僅作紀錄，不寫入任何檔案）")
+    if args.self_test:
+        print(f"（--self-test 自我測試；專案代號 {args.project or '(未給)'} "
+              f"僅作紀錄，不寫入任何檔案）")
         try:
             demo(errors, warns, infos)
         except Exception as e:  # noqa: BLE001
             errors.append(f"自我測試中斷（{type(e).__name__}: {e}）— "
                           f"該怎麼辦：先跑 python setup_check.py 確認套件與素材庫")
     else:
-        e, w, i = cmd_scan(args.專案代號)
+        if not args.project:
+            ap.error("要指定專案代號（只有 --self-test 可以省略）")
+        e, w, i = cmd_scan(args.project)
         errors += e
         warns += w
         infos += i
@@ -1133,13 +1147,22 @@ def main() -> int:
     print("=" * 66)
     if errors:
         print(f"結果：{len(errors)} 個 error、{len(warns)} 個 warning → 擋下")
-        return 1
+        return EX_ERROR
     if warns:
         print(f"結果：{len(warns)} 個 warning → 放行，但報告必須寫明口徑")
-        return 2
+        return EX_WARN
     print(f"結果：全部通過（{len(infos)} 項）")
-    return 0
+    return EX_OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"⛔ retransform.py 本身失敗：{type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        print(f"   → 退出碼 {EX_SOFTWARE}（腳本自身異常）。修腳本（00 §八）。",
+              file=sys.stderr)
+        raise SystemExit(EX_SOFTWARE) from exc

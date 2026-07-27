@@ -20,9 +20,14 @@
      算法，任何一邊分母寫錯兩邊就不會相等。這是免費的斷言 —— 不一致直接 raise，
      不是印個警告讓你自己決定要不要理。
 
+  5. **M1 → M2 閘門（04 §一 步驟⑤）**。開頭先讀 `統計表/資料體檢/M1_品質檢查三桶.json`，
+     error 桶非空就擋下並逐條列出「哪幾條、怎麼解除」。04 §一 明訂三桶是 M1 → M2 的
+     **唯一**放行機制 —— 而「唯一放行機制」只在下游真的去讀它時才成立。逃生門是
+     `--ignore-quality-gate`，它會印醒目警告並寫進執行紀錄，讓繞過這件事留痕。
+
 用法：
 
-    # 命令列（三桶 + 退出碼 0/1/2）
+    # 命令列（三桶 + 退出碼，見下）
     python build_features.py 2026Q3_電商 --as-of 2012-12-01
     python build_features.py 課程驗證 --as-of 2012-12-01 \
         --source ".../ntu_creditcard__transactions.parquet" \
@@ -35,8 +40,12 @@
     res.features        # DataFrame，一列一位顧客
     res.checks          # 雙路徑驗算結果（含 max_abs_diff）
 
-退出碼：0 = 全通過｜1 = 有 error（驗算不符／缺必要欄位），特徵表不可用｜
-        2 = 只有 warning（如缺 txn_type、先驗群過小），特徵表可用但要在報告註明。
+退出碼（全庫統一，權威定義見 references/00_通則與紀律.md §八）：
+    0  = 全通過
+    1  = 有 error（驗算不符／缺必要欄位），特徵表不可用
+    2  = 只有 warning（如缺 txn_type、先驗群過小），特徵表可用但要在報告註明
+    64 = 用法錯誤（旗標打錯、缺 --as-of、--colmap 格式錯）—— 一列資料都沒讀
+    70 = 腳本自身異常
 
 規格出處：17 §一～§五（公式與去重）、18-G4（唯一介面）、00 §1.3（雙路徑）、
           09 §2.1（CRI 的先驗與變異數口徑）、09 §2.2（Bob Stone 不給預設值）。
@@ -45,6 +54,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 import sys
@@ -58,6 +68,11 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from db import connect  # noqa: E402
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_USAGE, EX_SOFTWARE, GateArgumentParser,
+)
+from demographic_vars import (  # noqa: E402
+    PRIOR_BEHAVIORAL, PRIOR_NONE, classify_prior_cols, describe_prior_cols)
 from paths import project_dir  # noqa: E402
 
 if sys.platform == "win32":
@@ -115,6 +130,86 @@ BENCHMARK = {
 }
 BENCHMARK_ROWS = {"原始交易": 7764, "去重後": 5294, "間隔數": 5194}
 BENCHMARK_CAI_RANGE = (-43.665943, 54.590571)
+
+# 04 §一 步驟⑤：check_data_quality.py 的三桶結果，M1 → M2 的**唯一放行機制**。
+# 落點由 03 §1.2 固定，與 check_data_quality.write_quality_report() 同一個路徑。
+QUALITY_GATE_REL = ("統計表", "資料體檢", "M1_品質檢查三桶.json")
+
+
+# ══════════════════════════════════════════════════════════════════
+# M1 → M2 放行閘門（04 §一 步驟⑤）
+# ══════════════════════════════════════════════════════════════════
+
+def quality_gate_path(p: Any) -> Path:
+    """三桶結果 JSON 的位置。"""
+    return p.root.joinpath(*QUALITY_GATE_REL)
+
+
+def read_quality_gate(p: Any) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+    """讀三桶 JSON。回傳 (error 桶條目, meta, 讀取失敗的理由)。
+
+    讀不到就回理由字串，由呼叫端決定要擋還是要放 —— 這支不自己決定政策。
+    """
+    gp = quality_gate_path(p)
+    if not gp.exists():
+        return [], {}, f"找不到 {gp}"
+    try:
+        data = json.loads(gp.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return [], {}, f"{gp} 解析失敗：{e}"
+    findings = data.get("findings")
+    if not isinstance(findings, list):
+        return [], {}, f"{gp} 沒有 findings 陣列，格式不是 check_data_quality.py 的產出"
+    errs = [f for f in findings
+            if isinstance(f, dict) and str(f.get("bucket", "")).lower() == "error"]
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    return errs, meta, ""
+
+
+def check_quality_gate(project: str, p: Any, *, ignore: bool = False) -> list[str]:
+    """M1 閘門。回傳要寫進執行紀錄與主控台的訊息；要擋住就丟 FeatureBuildError。
+
+    為什麼在這裡擋（而不是靠人記得先跑 check_data_quality.py）：
+      04 §一 明訂三桶是 M1 → M2 的**唯一**放行機制，而「唯一放行機制」只在
+      下游真的去讀它的時候才成立。品質檢查 exit 1 之後直接跑 build_features
+      不會被擋 = 閘門形同虛設，而 M1 的錯誤全部是靜默的（哨兵值 9999 讓平均
+      間隔差 18.5 倍、Grand Total 列衝上 CAI 榜首），沒有紅字會提醒你。
+
+    `ignore=True`（CLI 的 --ignore-quality-gate）是逃生門，不是預設值：
+      它會印醒目警告並寫進執行紀錄，讓「誰在什麼時候繞過了閘門」留痕。
+    """
+    errs, meta, why = read_quality_gate(p)
+    gp = quality_gate_path(p)
+
+    if why:
+        fact = (f"M1 品質檢查三桶找不到或讀不了（{why}）— "
+                f"04 §一 步驟⑤：三桶是 M1 → M2 的唯一放行機制，沒跑過就不算放行")
+        todo = (f"先跑：python check_data_quality.py {project} "
+                f"--file <別名>=<路徑> --contract <契約>；"
+                f"它會寫出 {gp}。真的要先看特徵表就加 --ignore-quality-gate")
+        if ignore:
+            return [f"⚠ 已用 --ignore-quality-gate 繞過 M1 閘門：{fact}"]
+        raise FeatureBuildError(f"{fact} — {todo}")
+
+    when = str(meta.get("generated_at", "") or "?")
+    if errs:
+        lines = [f"M1 品質檢查三桶有 {len(errs)} 條未解除的 error（{gp}，產出於 {when}）："]
+        for f in errs:
+            lines.append(
+                f"    · {f.get('rule', '?')} {f.get('name', '')}｜"
+                f"{f.get('target', '')}｜{f.get('detail', '')}")
+        lines.append(
+            "  解除途徑只有一條（02 §十）：在契約的 quality_overrides: 逐條宣告 "
+            "rule / decision / reason / decided_by / decided_on，重跑 "
+            f"check_data_quality.py {project} …，讓上列條目降到 info 之後再回來。")
+        if ignore:
+            return ["⚠ 已用 --ignore-quality-gate 繞過 M1 閘門：" + "\n".join(lines)]
+        raise FeatureBuildError(
+            "\n".join(lines)
+            + "\n  —— 04 §一 步驟⑤：error 桶非空就停在 M1，不准進 M2。"
+              "確定要在明知有 error 的情況下先看特徵表，才加 --ignore-quality-gate")
+
+    return [f"M1 閘門通過：{gp} 的 error 桶為空（產出於 {when}）"]
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -197,6 +292,11 @@ class BuildResult:
     infos: list[str] = field(default_factory=list)
     row_counts: dict[str, int] = field(default_factory=dict)
     written: dict[str, str] = field(default_factory=dict)
+    # M1 三桶閘門是不是被 --ignore-quality-gate 繞過了。要留痕（04 §一 步驟⑤）。
+    gate_bypassed: bool = False
+    # CRI 先驗群的機器可讀血緣（07 §3.1）。內容同時寫進特徵表的三個欄位、
+    # 倉儲的 meta_cri_lineage 表與執行紀錄，下游不必相信任何人的自我宣告。
+    prior_lineage: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -617,6 +717,7 @@ def build_features(
     prior_group_cols: Sequence[str] | None = None,
     bobstone_custom: BobStoneCustom | None = None,
     write: bool = True,
+    ignore_quality_gate: bool = False,
 ) -> BuildResult:
     """產生顧客特徵表。**這是特徵表的唯一介面（18-G4）。**
 
@@ -628,8 +729,14 @@ def build_features(
     dim_source        顧客維度來源（算 CRI 的先驗分群用）。
     prior_group_cols  先驗分群欄位，如 ["性別", "居住地"]。09 §2.1：人口變數**可以**
                       當先驗分群，但**不可以**當下游 k-means 的輸入（18-E2 的邊界）。
+                      這裡給了什麼欄，會由 demographic_vars.py 判定是不是人口變數，
+                      結果寫進特徵表的 prior_group_type / prior_group_cols /
+                      prior_group_demographic_cols 三欄與倉儲表 meta_cri_lineage，
+                      prep_cluster_matrix.py 據此決定 CRI 能不能進矩陣（07 §3.1）。
     bobstone_custom   自訂 Bob Stone 參數。不給就不算 —— 09 §2.2 明訂不給預設值。
     write             是否把結果寫進倉儲、顧客特徵表/ 與 執行紀錄/。
+    ignore_quality_gate  繞過 M1 三桶閘門（04 §一 步驟⑤）。**逃生門，不是預設值**，
+                      繞過的事實會印醒目警告並寫進執行紀錄。
     """
     if as_of is None or (isinstance(as_of, str) and not as_of.strip()):
         raise FeatureBuildError(
@@ -639,6 +746,15 @@ def build_features(
 
     res = BuildResult(features=pd.DataFrame(), as_of=as_of_d)
     p = project_dir(project)
+
+    # M1 → M2 閘門。擺在最前面 —— 品質沒過就不該花時間算特徵，更不該產出一張
+    # 每個數字都算對、但建立在髒資料上的特徵表（04 §一 步驟⑤）。
+    gate_msgs = check_quality_gate(project, p, ignore=ignore_quality_gate)
+    res.gate_bypassed = ignore_quality_gate
+    if ignore_quality_gate:
+        res.warnings += gate_msgs
+    else:
+        res.infos += gate_msgs
 
     with connect(project) as con:
         scan = _scan_expr(source)
@@ -807,10 +923,20 @@ def build_features(
             for c in ("prior_group", "n_i", "ie_xbar", "s2_i", "ge_mu_g",
                       "tau2_g", "w1", "w2", "be_shrunk", "cri"):
                 feat[c] = np.nan
+            # 一列 CRI 都沒算出來 → 血緣就是 none，不管參數給了什麼欄
+            res.prior_lineage.update({"prior_group_type": PRIOR_NONE,
+                                      "n_prior_groups": 0})
             res.warnings.append(
                 "沒有先驗分群層 → CRI 全部標 N/A（00 §五 M8-1 的降級規則）— "
                 "要算就給 dim_source 與 prior_group_cols，"
                 "例如 --dim customers.parquet --prior-group-cols 性別")
+
+        # ── 6b. 血緣欄位：讓下游不必相信自我宣告（07 §3.1）──────
+        # 三欄都是每列相同的常數欄。刻意不做成 sidecar 檔：特徵表被複製、
+        # 改名、轉手之後，血緣還是跟著資料走，這正是 18-E2 攔不到的那個破口。
+        for c in ("prior_group_type", "prior_group_cols",
+                  "prior_group_demographic_cols"):
+            feat[c] = res.prior_lineage[c]
 
         feat.insert(1, "as_of_date", pd.Timestamp(as_of_d).date())
         feat["f_item_cnt"] = np.nan   # 來源無品項數欄；17 §二的三段不等式只驗到前兩段
@@ -847,9 +973,29 @@ def _build_group_map(
     con: Any, dim_source: str | Path | None,
     cols: Sequence[str] | None, res: BuildResult,
 ) -> pd.DataFrame | None:
-    """把顧客維度的人口欄位串成先驗分群鍵。"""
+    """把顧客維度欄位串成先驗分群鍵，同時**判定並記下血緣**（07 §3.1）。
+
+    血緣不是註解，是資料。判定結果會進特徵表的 prior_group_type /
+    prior_group_cols / prior_group_demographic_cols 三欄，
+    prep_cluster_matrix 拿它當 CRI 能不能進矩陣的依據 —— 不再看 spec 的自我宣告。
+    """
+    # 沒有先驗分群層時血緣就是 none —— CRI 會全部標 N/A，不存在「用什麼分」的問題。
+    res.prior_lineage = {
+        "prior_group_type": PRIOR_NONE,
+        "prior_group_cols": "",
+        "prior_group_demographic_cols": "",
+        "prior_group_dim_source": "",
+        "n_prior_groups": 0,
+    }
     if dim_source is None or not cols:
         return None
+    ptype, demo = classify_prior_cols(cols)
+    res.prior_lineage.update({
+        "prior_group_type": ptype,
+        "prior_group_cols": ",".join(str(c) for c in cols),
+        "prior_group_demographic_cols": ",".join(demo),
+        "prior_group_dim_source": str(dim_source),
+    })
     scan = _scan_expr(dim_source)
     have = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {scan}").fetchall()]
     missing = [c for c in cols if c not in have]
@@ -870,9 +1016,19 @@ def _build_group_map(
         SELECT CAST({_quote(key)} AS BIGINT) AS cust_id, {expr} AS prior_group
         FROM {scan}
     """).df()
+    res.prior_lineage["n_prior_groups"] = int(gm["prior_group"].nunique())
     res.infos.append(
         f"先驗分群：{'×'.join(cols)} → {gm['prior_group'].nunique()} 群。"
-        f"⚠ 09 §2.1：人口變數可以當先驗分群，但不可以當下游 k-means 的輸入（18-E2）")
+        f"血緣判定 prior_group_type = {ptype}（{describe_prior_cols(cols)}）")
+    if ptype != PRIOR_BEHAVIORAL:
+        res.warnings.append(
+            f"CRI 的先驗群含人口變數（{'、'.join(demo)}）→ 血緣 {ptype}，"
+            f"**這批 CRI 不得進 M6 分群矩陣**（07 §3.1）。"
+            f"09 §2.1：人口變數可以當先驗分群，但交易紀錄相同的兩人會因人口欄不同"
+            f"拿到不同 CRI，等於把人口變數以非線性編碼送進矩陣。"
+            f"已把血緣寫進特徵表的 prior_group_type 欄，prep_cluster_matrix 會擋下；"
+            f"要讓 CRI 進矩陣就改用行為分層（如 F 三分位）重跑。"
+            f"另外 07 §8.4 排除條款：{'、'.join(demo)} 也不得進卡方表")
     return gm
 
 
@@ -881,6 +1037,12 @@ def _write_outputs(con: Any, p: Any, res: BuildResult, project: str) -> None:
     df = res.features
     con.register("df_feat", df)
     con.execute("CREATE OR REPLACE TABLE feat_customer AS SELECT * FROM df_feat")
+
+    # CRI 血緣的獨立表：特徵表的三個常數欄之外再留一張可查詢的表，
+    # 記到 as_of 與維度來源。有人問「這批 CRI 的先驗群是誰」時一句 SQL 就有答案。
+    lin = pd.DataFrame([{"as_of_date": res.as_of, **res.prior_lineage}])
+    con.register("df_lineage", lin)
+    con.execute("CREATE OR REPLACE TABLE meta_cri_lineage AS SELECT * FROM df_lineage")
 
     p.features.mkdir(parents=True, exist_ok=True)
     p.log.mkdir(parents=True, exist_ok=True)
@@ -893,6 +1055,33 @@ def _write_outputs(con: Any, p: Any, res: BuildResult, project: str) -> None:
         "",
         f"- 產出：`{fp}`（{len(df)} 位顧客、{df.shape[1]} 欄）",
         f"- 列數流：" + " → ".join(f"{k} {v:,}" for k, v in res.row_counts.items()),
+        "",
+        "## M1 → M2 放行閘門（04 §一 步驟⑤）",
+        "",
+    ]
+    if res.gate_bypassed:
+        lines += [
+            "> ⚠⚠ **本次執行帶了 `--ignore-quality-gate`，繞過了 M1 三桶閘門。**",
+            "> 這張特徵表**未經 M1 放行**：不准直接進報告、不准進 M6 分群，",
+            "> 引用它的每一個數字都要標明這件事（04 §一 步驟⑤、00 §四 降級規則）。",
+            "",
+        ]
+    lines += [f"- {m}" for m in (res.warnings if res.gate_bypassed else res.infos)
+              if m.startswith(("M1 閘門通過", "⚠ 已用 --ignore-quality-gate"))]
+    lines += [
+        "",
+        "## CRI 先驗群血緣（07 §3.1）",
+        "",
+        f"- `prior_group_type` = **{res.prior_lineage.get('prior_group_type')}**"
+        f"（{'CRI 可進 M6 分群矩陣' if res.prior_lineage.get('prior_group_type') == PRIOR_BEHAVIORAL else 'CRI 不得進 M6 分群矩陣'}）",
+        f"- 先驗群欄位：{describe_prior_cols(res.prior_lineage.get('prior_group_cols', '').split(',') if res.prior_lineage.get('prior_group_cols') else [])}",
+        f"- 命中人口變數清單：{res.prior_lineage.get('prior_group_demographic_cols') or '（無）'}",
+        f"- 維度來源：{res.prior_lineage.get('prior_group_dim_source') or '（無）'}"
+        f"｜群數：{res.prior_lineage.get('n_prior_groups')}",
+        "- 同一份判定已寫進特徵表的 `prior_group_type` / `prior_group_cols` /",
+        "  `prior_group_demographic_cols` 三欄與倉儲表 `meta_cri_lineage`。",
+        "  `prep_cluster_matrix.py` 以**資料裡這份**為準，`cluster_spec.json` 的",
+        "  `cri_prior_type` 只做交叉檢查 —— 兩者不一致直接 error。",
         "",
         "## 雙路徑交叉驗算（00 §1.3）",
         "",
@@ -956,7 +1145,7 @@ def check_benchmark(res: BuildResult) -> tuple[list[str], list[str]]:
 
 
 # ══════════════════════════════════════════════════════════════════
-# CLI：三桶 + 退出碼 0/1/2
+# CLI：三桶 + 退出碼 0/1/2/64/70（00 §八）
 # ══════════════════════════════════════════════════════════════════
 
 def _parse_colmap(items: list[str] | None) -> dict[str, str] | None:
@@ -965,14 +1154,17 @@ def _parse_colmap(items: list[str] | None) -> dict[str, str] | None:
     out: dict[str, str] = {}
     for it in items:
         if "=" not in it:
-            raise SystemExit(f"--colmap 格式錯誤：{it} — 要寫成 canonical=來源欄名")
+            # 命令列格式錯 = 用法錯誤，走 64 不走 argparse 預設的 1/2
+            print(f"⛔ --colmap 格式錯誤：{it} — 要寫成 canonical=來源欄名",
+                  file=sys.stderr)
+            raise SystemExit(EX_USAGE)
         k, v = it.split("=", 1)
         out[k.strip()] = v.strip()
     return out
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(
+    ap = GateArgumentParser(
         description="產生顧客特徵表（18-G4 明訂的唯一介面）",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("project", help="專案代號")
@@ -984,15 +1176,29 @@ def main() -> int:
                     help="欄名對照覆寫，可重複")
     ap.add_argument("--dim", default=None, help="顧客維度來源（算 CRI 的先驗分群用）")
     ap.add_argument("--prior-group-cols", default=None,
-                    help="先驗分群欄位，逗號分隔，如「性別,居住地」")
+                    help="先驗分群欄位，逗號分隔，如「性別,居住地」。"
+                         "是不是人口變數會自動判定並寫進特徵表的血緣欄（07 §3.1）")
     ap.add_argument("--benchmark", action="store_true",
                     help="與 17 §八 的 ground truth 逐位比對")
     ap.add_argument("--no-write", action="store_true", help="不寫檔，只算")
+    ap.add_argument("--ignore-quality-gate", action="store_true",
+                    help="繞過 M1 三桶閘門（04 §一 步驟⑤）。逃生門，不是常態 —— "
+                         "會印醒目警告並寫進執行紀錄")
     args = ap.parse_args()
 
     print("=" * 66)
     print(f"顧客特徵表 build_features｜專案 {args.project}｜as_of {args.as_of}")
     print("=" * 66)
+    if args.ignore_quality_gate:
+        print()
+        print("⚠" * 33)
+        print("⚠  --ignore-quality-gate：M1 → M2 的閘門被關掉了")
+        print("⚠  04 §一 步驟⑤ 明訂三桶是 M1 → M2 的唯一放行機制。")
+        print("⚠  這次產出的特徵表未經 M1 放行 —— 不准直接進報告、不准進 M6 分群，")
+        print("⚠  引用它的每一個數字都要標明「M1 閘門被繞過」。")
+        print("⚠  正解是回去把 error 條目解決，或在契約的 quality_overrides 逐條宣告。")
+        print("⚠" * 33)
+        print()
 
     errors: list[str] = []
     warnings: list[str] = []
@@ -1005,7 +1211,8 @@ def main() -> int:
         res = build_features(
             args.project, args.as_of, source=args.source,
             colmap=_parse_colmap(args.colmap), dim_source=args.dim,
-            prior_group_cols=cols, write=not args.no_write)
+            prior_group_cols=cols, write=not args.no_write,
+            ignore_quality_gate=args.ignore_quality_gate)
     except FeatureBuildError as e:
         errors.append(str(e))
     except Exception as e:  # noqa: BLE001
@@ -1046,13 +1253,24 @@ def main() -> int:
     print("\n" + "=" * 66)
     if errors:
         print(f"結果：{len(errors)} 個 error、{len(warnings)} 個 warning → 特徵表不可用")
-        return 1
+        return EX_ERROR
     if warnings:
         print(f"結果：{len(warnings)} 個 warning → 特徵表可用，報告需註明")
-        return 2
+        if args.ignore_quality_gate:
+            print("      其中包含「M1 閘門被繞過」—— 這張表未經 M1 放行，"
+                  "不准直接進報告或進 M6 分群。")
+        return EX_WARN
     print(f"結果：全部通過（{len(infos)} 項）→ 特徵表可用")
-    return 0
+    return EX_OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"⛔ build_features.py 本身失敗：{type(exc).__name__}: {exc}\n"
+              f"   → 退出碼 {EX_SOFTWARE}（腳本自身異常）。修腳本（00 §八）。",
+              file=sys.stderr)
+        raise SystemExit(EX_SOFTWARE) from exc

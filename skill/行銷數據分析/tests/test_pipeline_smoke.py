@@ -298,22 +298,36 @@ def test_prep_whitelist_blocks_demographics(root, r_prep):
     assert "18-E2" in r.all
 
 
-def test_prep_cri_lineage_blocks_missing_declaration(r_prep_template):
-    """CRI 血緣檢查本身有效：spec 沒宣告 cri_prior_type 就擋。"""
-    assert r_prep_template.rc == 1, r_prep_template
-    assert "cri_prior_type" in r_prep_template.all
+def test_prep_cri_lineage_blocks_missing_declaration(root, feat_path, tmp_path):
+    """CRI 血緣檢查本身有效：input_vars 有 cri、但血緣不是 behavioral 就擋。
+
+    這批特徵表（PROJ）跑 build_features 時沒給 --dim／--prior-group-cols，
+    所以資料側的血緣是 none —— 沒有先驗群就沒有 τ²_g，CRI 整欄 N/A，
+    spec 不管怎麼宣告都不該放行。
+
+    刻意自備一份 spec，不用出貨範本 —— 範本的 input_vars 已經不含 cri 了
+    （含了就必須同時宣告血緣型別）。這裡要驗的是「檢查本身有效」，
+    不是「範本剛好壞掉」。拿壞掉的範本當測試素材，範本修好那天這條就會誤報。
+    """
+    spec = tmp_path / "cluster_spec_無血緣宣告.json"
+    spec.write_text(json.dumps(
+        {"input_vars": ["r_days_since_last_sale", "f_txn_cnt", "cri"],
+         "scaler": "zscore", "k": 4, "seed": 42}, ensure_ascii=False), encoding="utf-8")
+    r = run("prep_cluster_matrix.py", PROJ, "--input", str(feat_path),
+            "--spec", str(spec), "--dry-run", root=root)
+    assert r.rc == 1, r
+    assert "CRI" in r.all and "input_vars" in r.all
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "介面缺陷：出貨範本 templates/cluster_spec.json 的 input_vars 帶 cri，"
-    "卻沒有 cri_prior_type；照 SKILL 教的 cp 範本再跑 prep_cluster_matrix 直接 exit 1。"))
 def test_shipped_template_works_out_of_the_box(r_prep_template):
+    """cp 出貨範本 → 接 build_features 的產出跑 prep_cluster_matrix，不准 exit 1。
+
+    範本的 input_vars 用 build_features 真的會產出的欄名（r_days_since_last_sale /
+    f_txn_cnt / m_net_twd / cai），cri 預設不進矩陣、cri_prior_type 預設 null。
+    """
     assert r_prep_template.rc in (0, 2), r_prep_template
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "介面缺陷：範本 input_vars 寫 ln_f / ln_m，build_features 產出的是 "
-    "f_txn_cnt / m_net_twd，兩邊欄名對不上。"))
 def test_template_input_vars_exist_in_build_features_output(feat_path, spec_path):
     import pandas as pd
     cols = set(pd.read_parquet(feat_path).columns)
@@ -321,12 +335,14 @@ def test_template_input_vars_exist_in_build_features_output(feat_path, spec_path
     assert want <= cols, f"範本要的欄不在特徵表：{sorted(want - cols)}"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "介面缺陷：CRI 血緣只讀 spec 裡人工填的 cri_prior_type，不看 build_features "
-    "留在同一張表 prior_group 欄的實際值。用 --prior-group-cols 性別 算出來的 CRI，"
-    "只要 spec 打 behavioral 就一路綠燈。"))
 def test_cri_lineage_detects_demographic_prior_group(root):
     import pandas as pd
+    # M1 閘門（04 §一 步驟⑤）：build_features 會先讀三桶 JSON，沒跑過品質檢查
+    # 就直接擋掉並回 1。這一關必須先過，否則本測試量到的是閘門、不是血緣檢查。
+    rq = run("check_data_quality.py", PROJ_CRI,
+             "--file", f"transactions={SAMPLE}", "--as-of", AS_OF, root=root)
+    assert rq.rc in (0, 2), f"品質檢查沒放行，後面的血緣檢查驗不到\n{rq}"
+
     r = run("build_features.py", PROJ_CRI, "--as-of", AS_OF, "--source", str(SAMPLE),
             "--dim", str(DIM), "--prior-group-cols", "性別", root=root)
     assert r.rc == 2, r
@@ -390,30 +406,79 @@ def test_anova3_rewrites_formula_and_records_it(factorial_df):
 
 
 def test_stats_utils_selftest_exits_0(root):
-    r = run("stats_utils.py", "--selftest", root=root)
+    r = run("stats_utils.py", "--self-test", root=root)
     assert r.rc == 0, r
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "穩健性缺陷：設計矩陣有空格（15 類 × 國內/國外）時，sum-to-zero 編碼的 "
-    "type-III 約束矩陣降秩，anova3 回傳的表所有項 F/p 完全相同（垃圾）。"
-    "_ss_double_check 已判定 passed=False，但只在 verbose 時印 stderr，不 raise —— "
-    "呼叫端不主動看 .attrs['ss_check'] 就拿到假結果。"))
-def test_anova3_refuses_rank_deficient_design():
-    sys.path.insert(0, str(SCRIPTS))
+@pytest.fixture(scope="session")
+def rank_deficient_df():
+    """15 類 × 國內/國外，其中 3 類沒有國外列 → 3 個空 cell、設計矩陣降秩。"""
     import numpy as np
     import pandas as pd
-    from stats_utils import anova3
     df = pd.read_parquet(SAMPLE).rename(
         columns={"刷卡產品產業分類": "a", "刷卡地點": "b", "刷卡金額": "y"})
     df["y"] = np.log1p(df["y"])
-    tbl = anova3("y ~ C(a)*C(b)", data=df[["a", "b", "y"]], verbose=False)
+    return df[["a", "b", "y"]]
+
+
+def test_design_check_lists_empty_cells(rank_deficient_df):
+    """跑 anova 之前就要抓到降秩，而且要點名是哪些組合。"""
+    sys.path.insert(0, str(SCRIPTS))
+    from stats_utils import design_check
+    d = design_check("y ~ C(a)*C(b)", rank_deficient_df)
+    assert d["rank_deficient"]
+    assert (d["n_cols"], d["rank"], d["deficiency"]) == (30, 27, 3), d
+    combos = {c for e in d["empty_cells"] for c in e["cells"]}
+    assert combos == {("05_捐贈", "國外"), ("13_交通(含加值)", "國外"),
+                      ("X2.中信錢加值", "國外")}, combos
+
+
+def test_anova3_refuses_rank_deficient_design(rank_deficient_df):
+    """降秩設計必須 raise，不是回一張所有 F/p 都相同的垃圾表。"""
+    sys.path.insert(0, str(SCRIPTS))
+    from stats_utils import RankDeficientDesignError, anova3
+    with pytest.raises(RankDeficientDesignError) as ei:
+        anova3("y ~ C(a)*C(b)", data=rank_deficient_df, verbose=False)
+    msg = str(ei.value)
+    # 訊息要講清楚：哪個設計、哪些空 cell、差多少、該怎麼辦
+    assert "30 欄但秩只有 27" in msg, msg
+    assert "13_交通(含加值) × 國外" in msg, msg
+    assert "anova_degrade" in msg and "allow_rank_deficient" in msg, msg
+
+
+def test_anova3_allow_rank_deficient_carries_visible_warning(rank_deficient_df):
+    """顯式放行時，警告必須寫進回傳表的可見欄位，不是只印 stderr。"""
+    sys.path.insert(0, str(SCRIPTS))
+    import numpy as np
+    from stats_utils import anova3
+    tbl = anova3("y ~ C(a)*C(b)", data=rank_deficient_df,
+                 verbose=False, allow_rank_deficient=True)
     f = tbl["F"].dropna().to_numpy(dtype=float)
-    degenerate = bool(np.allclose(f, f[0], rtol=1e-6))
-    assert tbl.attrs["ss_check"]["passed"] and not degenerate, (
-        f"SS 雙路徑驗算 passed={tbl.attrs['ss_check']['passed']}、"
-        f"所有效果的 F 都等於 {f[0]:.6f}（主效果與交互作用一模一樣），"
-        f"函式卻照樣把這張表回傳出去")
+    assert np.allclose(f, f[0], rtol=1e-6), "這份資料本來就該是退化的，fixture 變了"
+    assert "警告" in tbl.columns, list(tbl.columns)
+    assert tbl["警告"].notna().all() and (tbl["警告"] != "").all()
+    assert tbl.attrs["可信"] is False
+    assert tbl.attrs["ss_check"]["passed"] is False
+
+
+def test_anova_degrade_gives_usable_fallback(rank_deficient_df):
+    """00 §1.6：降級不留空 —— 要退到一個真的可信的結果，並交代四件事。"""
+    sys.path.insert(0, str(SCRIPTS))
+    import pandas as pd
+    from stats_utils import anova_degrade
+    r = anova_degrade("y ~ C(a)*C(b)", rank_deficient_df, verbose=False)
+    assert r["階梯"] in (2, 3, 4), r["階梯"]
+    assert isinstance(r["table"], pd.DataFrame)
+    assert r["table"].attrs["可信"] is True
+    for k in ("原方法", "失效證據", "實際採用", "結論弱在哪"):
+        assert r[k], f"{k} 留空了（00 §1.6 不准）"
+
+    # min_cell=1 時合併救不回來，必須再退一格到主效果模型 + Type II
+    r3 = anova_degrade("y ~ C(a)*C(b)", rank_deficient_df, min_cell=1, verbose=False)
+    assert r3["階梯"] == 3, r3["ladder_log"]
+    assert r3["table"].attrs["typ"] == 2
+    assert r3["table"].attrs["ss_check"]["passed"] is True
+    assert "不能主張交互作用" in r3["結論弱在哪"]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -459,24 +524,91 @@ def test_verify_list_exits_0(root):
     assert r.rc == 0, r
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "介面衝突：verify_outputs 的 C01/C02/T03 把 統計表/**/*.csv 全當交付檔掃，"
-    "而 統計表/資料體檢/M1_品質檢查三桶.csv（check_data_quality 寫的）與 "
-    "統計表/轉換前後對照/cluster_matrix_transform.csv（prep_cluster_matrix 寫的）"
-    "本來就有空白格、'none' 字樣、以及 0–1 而非 0–100 的占比欄。"
-    "照著 SKILL 跑完 M1→M6，M7 的驗收一定紅。"))
+# ── 反向題：gate 在**正常**專案上會不會放行 ────────────────
+PROJ_CLEAN = "冒煙_乾淨交付"
+
+
+@pytest.fixture(scope="session")
+def clean_delivery(root):
+    """按 verify_outputs 的輸入契約做一份完整交付物（fixtures/make_clean_delivery.py）。
+
+    四份中繼檔的產生腳本（build_report / result_bundle / collect_figures /
+    stamp_version）都還沒實作，沒有這份 fixture 就只驗得到「擋不擋得住壞的」，
+    驗不到「好的放不放得過」—— 而後者才是 exit 0 存在的理由。
+    """
+    env = dict(os.environ, **{"MKT_專案根目錄": str(root), "PYTHONIOENCODING": "utf-8"})
+    maker = Path(__file__).resolve().parent / "fixtures" / "make_clean_delivery.py"
+    cp = subprocess.run([sys.executable, str(maker), PROJ_CLEAN],
+                        capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", env=env, timeout=300)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    return root / PROJ_CLEAN
+
+
+def test_verify_exits_0_on_a_clean_project(root, clean_delivery):
+    r = run("verify_outputs.py", PROJ_CLEAN, root=root)
+    assert r.rc == 0, r
+    assert "全綠" in r.all, r
+
+
+def test_clean_project_stays_green_with_upstream_qa_tables(root, clean_delivery, r_prep):
+    """把上游腳本真的寫出來的 QA 中繼產物搬進乾淨專案，仍然要 exit 0。
+
+    ①（QA 中繼產物誤擋）的回歸鎖：手做的 fixture 不會有那些空白格與 0–1 占比欄，
+    真檔案才會 —— 所以這裡搬的是 check_data_quality／prep_cluster_matrix 的實際產出。
+    """
+    import shutil
+    src = root / PROJ / "統計表"
+    moved = 0
+    for p in src.rglob("*.csv"):
+        rel = p.relative_to(src)
+        if set(rel.parts[:-1]) & {"資料體檢", "轉換前後對照", "分群輪廓"}:
+            dst = clean_delivery / "統計表" / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dst)
+            moved += 1
+    assert moved >= 2, f"只搬到 {moved} 張 QA 中繼產物，這條測試是空的"
+    r = run("verify_outputs.py", PROJ_CLEAN, root=root)
+    assert r.rc == 0, r
+
+
 def test_verify_accepts_upstream_scripts_own_tables(root, r_quality, r_prep):
+    """19 §5.5：統計表/{資料體檢,轉換前後對照,分群輪廓}/ 是 QA 中繼產物不是交付表。
+
+    這三類本來就有空白格（非比率型規則沒有母數）與 0–1 的比率欄，
+    照 §5.1~§5.4 判一定紅。gate 不掃它們 —— 掃了等於擋下自己上游的正常產出。
+    """
     r = run("verify_outputs.py", PROJ, "--only", "C01,C02,T03", root=root)
     assert r.rc == 0, r
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "介面缺陷：R01（無編號式英文目錄硬編路徑）掃的是 skill 自己的 references/，"
-    "不是專案交付物。references/14_決策轉譯.md 有 12 處 交付物/ 沒改乾淨，"
-    "於是**任何**專案跑 verify_outputs 都會被別人的檔案判 error。"))
+def test_qa_tables_really_exist_so_the_previous_test_is_not_vacuous(root, r_quality, r_prep):
+    """上一條若是因為根本沒表而過，等於什麼都沒驗。"""
+    tables = root / PROJ / "統計表"
+    qa = [p for p in tables.rglob("*.csv")
+          if set(p.relative_to(tables).parts[:-1])
+          & {"資料體檢", "轉換前後對照", "分群輪廓"}]
+    assert qa, f"{tables} 底下沒有任何 QA 中繼產物，上一條測試是空的"
+
+
+def test_qa_tables_are_still_scannable_on_demand(root, r_quality, r_prep):
+    """--include-qa-tables 要能把它們掃回來 —— 排除是預設值，不是把規則刪掉。"""
+    r = run("verify_outputs.py", PROJ, "--include-qa-tables",
+            "--only", "C01,T03", root=root)
+    assert r.rc == 1, r
+    assert "資料體檢" in r.all, r
+
+
 def test_verify_r01_is_clean_on_the_skill_itself(root):
-    r = run("verify_outputs.py", "--static-only", "--only", "R01", root=root)
+    r = run("verify_outputs.py", "--self-check", "--only", "R01", root=root)
     assert r.rc == 0, r
+
+
+def test_self_check_rules_do_not_judge_a_project(root, r_quality):
+    """19 §5.6：R01/R02 檢查的是 skill 自身，不該出現在專案模式的判定裡。"""
+    r = run("verify_outputs.py", PROJ, root=root)
+    assert "[R01]" not in r.all and "[R02]" not in r.all, r
+    assert "自檢規則不參與專案判定" in r.all, r
 
 
 # ══════════════════════════════════════════════════════════════
@@ -510,34 +642,59 @@ def test_help_exits_0(script, root):
 @pytest.mark.parametrize("script", ["profile_dataset.py", "check_data_quality.py",
                                     "build_features.py", "prep_cluster_matrix.py",
                                     "verify_outputs.py", "setup_check.py"])
-@pytest.mark.xfail(strict=True, reason=(
-    "退出碼語意衝突：全部腳本都宣告『2 = 只有 warning，可往下走』，"
-    "但 argparse 的用法錯誤（打錯旗標、漏必填參數）也是 exit 2。"
-    "驅動腳本分不出『有警告但跑完了』和『參數打錯，根本沒跑』。"))
 def test_usage_error_is_not_exit_2(script, root):
+    """用法錯誤必須是 64，不能跟『2 = 只有 warning，可往下走』撞在一起。
+
+    00 §八：驅動腳本靠退出碼決定要不要往下，2 和 64 混用會讓
+    `if [ $? -le 2 ]` 這種 wrapper 在腳本一列資料都沒讀的情況下 fail open。
+    """
     r = run(script, "--這個旗標不存在", root=root)
-    assert r.rc != 2, r
+    assert r.rc == 64, r
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "介面不一致：自我測試旗標三種寫法並存 —— stats_utils.py 是 --selftest、"
-    "pick_transform.py / write_transform_log.py 是 --self-test、"
-    "retransform.py 是 --demo；而且後三者還強制要先給位置參數專案代號，"
-    "stats_utils 不用。"))
+def test_user_mistakes_do_not_become_exit_70(root):
+    """使用者打錯不能被判成 70。
+
+    70 的語意是「腳本自身異常，修腳本」。把「檔案路徑打錯」「日期格式打錯」
+    也吐 70，會叫使用者去讀腳本原始碼找一個不存在的 bug。
+    分界：值／路徑不合法 → 64（命令列打錯）；路徑合法但東西不在 → 1（資料側）。
+    """
+    r = run("check_data_quality.py", PROJ, "--file", f"transactions={SAMPLE}",
+            "--as-of", "not-a-date", "--no-write", root=root)
+    assert r.rc == 64, f"--as-of 格式錯應該是 64，不是腳本壞了\n{r}"
+
+    missing = SAMPLE.with_name("這個檔案不存在.parquet")
+    r2 = run("check_data_quality.py", PROJ, "--file", f"transactions={missing}",
+             "--as-of", AS_OF, "--no-write", root=root)
+    assert r2.rc == 1, f"檔案不存在應該是 1（資料側），不是 70\n{r2}"
+
+
 def test_selftest_flag_is_uniform(root):
+    """自我測試旗標全庫一律 --self-test，且都不需要先給專案代號（00 §八）。
+
+    判準是「旗標被認得且自我測試真的跑完」= 退出碼落在三桶（0/1/2），
+    不是「一定全綠」—— write_transform_log 的自我測試用真實樣本跑，
+    課程資料的 Spearman 並列與偏度本來就會出 warning，那是 2 不是壞掉。
+    """
     bad = {}
     for script in ("stats_utils.py", "pick_transform.py", "write_transform_log.py",
                    "retransform.py"):
-        r = run(script, "--selftest", root=root)
-        if r.rc != 0:
+        r = run(script, "--self-test", root=root)
+        if r.rc not in (0, 1, 2):
             bad[script] = r.rc
     assert not bad, bad
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "介面不一致：verify_outputs.py / pick_transform.py / retransform.py 的位置參數叫 "
-    "`專案代號`（中文），其餘叫 `project`。要寫統一的 orchestrator 就得開特例。"))
+def test_old_selftest_spellings_are_gone(root):
+    """舊寫法 --selftest / --demo 必須退 64（用法錯誤），不准還能跑。"""
+    for script, flag in (("stats_utils.py", "--selftest"),
+                         ("retransform.py", "--demo")):
+        r = run(script, flag, root=root)
+        assert r.rc == 64, (script, flag, r)
+
+
 def test_positional_project_arg_is_named_consistently():
+    """位置參數的 dest 全庫一律 `project`（00 §八）。metavar 可以是中文。"""
     import ast
     names = {}
     for f in ("profile_dataset.py", "check_data_quality.py", "build_features.py",
@@ -574,20 +731,19 @@ def test_no_script_actually_bypasses_db_connect():
     assert not offenders, offenders
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "誤報：verify_outputs 的 R02 用逐行 regex 找 duckdb.connect()，會打到註解後半段"
-    "與字串常數。實際回報的三處全是誤報 —— profile_dataset.py:1226 是 "
-    "`from db import connect  # …不准自己 duckdb.connect()` 的行尾註解，"
-    "setup_check.py:197 是 dict 裡的說明字串，setup_check.py:320 是探測 duckdb "
-    "是否可用的 in-memory 連線。沒有任何腳本真的繞過 db.connect()。"))
 def test_verify_r02_has_no_false_positives(root):
-    r = run("verify_outputs.py", "--static-only", "--only", "R02", root=root)
+    """R02 改用 ast，不再打到行尾註解／字串常數／in-memory 探測。
+
+    逐行 regex 版本回報的三處全是誤報：profile_dataset.py 的
+    `from db import connect  # …不准自己 duckdb.connect()`（行尾註解）、
+    setup_check.py 的 BLOCKING_SCRIPTS 說明字串、以及 setup_check.py 的
+    `duckdb.connect()` 無參數 in-memory 探測。
+    """
+    r = run("verify_outputs.py", "--self-check", "--only", "R02", root=root)
     assert "duckdb.connect()" not in r.all, r
+    assert r.rc == 0, r
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "介面缺陷：Q16 只看有沒有 currency 欄，從不讀契約的 columns[].unit —— "
-    "但它自己的修法就寫『在契約的 columns[].unit 明寫幣別』。照做也清不掉警告。"))
 def test_q16_respects_contract_declared_unit(root):
     contract = REPO_ROOT / "skill" / "行銷數據分析" / "templates" / "contracts"
     src = next((p for p in contract.glob("*.yml")), None)
@@ -599,4 +755,9 @@ def test_q16_respects_contract_declared_unit(root):
     r = run("check_data_quality.py", PROJ, "--file", f"transactions={SAMPLE}",
             "--contract", str(dst), "--as-of", AS_OF, "--only", "Q16",
             "--no-write", root=root)
-    assert "Q16" not in r.all, r
+    # 契約宣告了幣別 → Q16 要降到 info 桶並標「已解除」，不是消失。
+    # 舊寫法斷言 "Q16" not in r.all，但 info 桶本來就會印出代號 —— 那樣
+    # 只有「整條規則被拿掉」才會過，等於逼修法往錯的方向走。
+    assert r.rc == 0, f"契約已宣告幣別卻沒全綠\n{r}"
+    assert "error 0、warning 0" in r.all, f"Q16 沒降到 info 桶\n{r}"
+    assert "已解除" in r.all, f"Q16 沒標記為已解除\n{r}"

@@ -2,12 +2,23 @@
 """
 統計推論的唯一合法介面 —— type-III ANOVA、事後檢定、效果量、迴歸診斷。
 
-為什麼需要它（三個「不報錯但給錯數字」的地方，靠人記是記不住的）：
+為什麼需要它（四個「不報錯但給錯數字」的地方，靠人記是記不住的）：
 
   1. **`anova_lm(typ=3)` 配 patsy 預設的 treatment coding 會靜默算錯主效果平方和**
      （18-T3）。實測同一份資料，主效果 SS 從 325.64 掉到 179.76，**少算 45%，
      不拋任何警告**。R 那邊有 `car` 會提醒你，Python 什麼都沒有。所以
      `anova3()` 強制把 `C(x)` 改寫成 `C(x, Sum)`，遇到明寫 treatment 就擋下來。
+
+  1b. **設計降秩（交叉表有空 cell）時 type-III 整張表都是垃圾，一樣不報錯。**
+     實測信用卡樣本：刷卡產品產業分類 15 類 × 刷卡地點 2 類，其中 3 類沒有國外列
+     → 設計矩陣 30 欄但秩只有 27，`anova_lm(typ=3)` 回傳的表
+     **Intercept／兩個主效果／交互作用的 F 全部等於 1.122059、p 全部 0.289509**，
+     主效果 SS 與交互作用 SS 一模一樣（22.130189）。statsmodels 只在內部丟一個
+     預設會被吞掉的 `ValueWarning`。所以 `anova3()` **事前**驗秩與空 cell、
+     **事後**驗平方和分解，任一關沒過就 raise（`RankDeficientDesignError` /
+     `SSDoubleCheckError`），不是印個警告讓你自己決定要不要理。要放行必須顯式傳
+     `allow_rank_deficient=True`，而且回傳表會被強制加上可見的「警告」欄。
+     降級走 `anova_degrade()`（00 §1.6 降級不留空）。
 
   2. **事後檢定選錯方法會讓型一錯誤失控**（16 §8.4）。常態與變異數同質是兩個
      獨立維度，必須分兩層問；變異數比 ≥ 4 時退 Kruskal-Wallis 是**往假設更強
@@ -24,23 +35,31 @@
 
     import sys; sys.path.insert(0, "<skill>/scripts")
     from stats_utils import (
-        anova3, posthoc, effect_sizes, compare_two_groups, chi2_safe,
-        plot_lm, vif_table, nested_f, emmeans, emm_contrasts, bh_correct,
+        anova3, anova_degrade, design_check, posthoc, effect_sizes,
+        compare_two_groups, chi2_safe, plot_lm, vif_table, nested_f,
+        emmeans, emm_contrasts, bh_correct,
     )
 
     tbl = anova3("CAI ~ C(教育程度) * C(性別)", df)     # 自動改寫成 C(x, Sum)
+    design_check("CAI ~ C(產業) * C(地點)", df)         # 先看設計矩陣秩與空 cell
+    deg = anova_degrade("CAI ~ C(產業) * C(地點)", df)  # 降秩時照 00 §1.6 階梯降級
     ph  = posthoc(df, dv="CAI", group="教育程度")        # 依 16 §8.4 自動選
     es  = effect_sizes(df, dv="CAI", group="性別")       # p + 效果量 + CI 三者並回
     fig = plot_lm(m, project="2026Q3_電商", name="迴歸診斷四圖.png")
 
-自我檢查（三桶 + 退出碼 0/1/2）：
+自我檢查（三桶 + 退出碼，全庫統一，權威定義見 00 §八）：
+    0  = 全通過
+    1  = 有 error，不可使用
+    2  = 只有 warning，可用但部分路徑要留意
+    64 = 用法錯誤（旗標打錯）
+    70 = 腳本自身異常
 
-    python stats_utils.py --selftest
-    python stats_utils.py --selftest --verbose
+    python stats_utils.py --self-test
+    python stats_utils.py --self-test --verbose
 
 實作判斷（reference 沒講到、由本檔決定的部分，逐條標記在對應函式的 docstring）：
   · 本檔是純函式庫，不讀專案資料，**CLI 沒有「專案代號」位置參數**，只有
-    `--selftest`。唯一會用到 `paths` 的是 `plot_lm(project=..., name=...)`
+    `--self-test`。唯一會用到 `paths` 的是 `plot_lm(project=..., name=...)`
     的存檔路徑與中文字型設定。
   · 08 §二 提到的循環相依（`stats_utils` ⇄ `templates/迴歸建模_程式範本.py`）
     在此的解法是：**本檔完全不 import 範本檔**。`influence_flags` /
@@ -49,7 +68,6 @@
 
 from __future__ import annotations
 
-import argparse
 import itertools
 import math
 import sys
@@ -67,16 +85,23 @@ from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from statsmodels.stats.multitest import multipletests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_SOFTWARE, GateArgumentParser,
+)
 from paths import cfg, project_dir  # noqa: E402
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
 __all__ = [
+    "RankDeficientDesignError",
+    "SSDoubleCheckError",
     "anova3",
+    "anova_degrade",
     "bh_correct",
     "chi2_safe",
     "compare_two_groups",
+    "design_check",
     "effect_sizes",
     "emm_contrasts",
     "emmeans",
@@ -86,6 +111,18 @@ __all__ = [
     "posthoc",
     "vif_table",
 ]
+
+
+class RankDeficientDesignError(ValueError):
+    """設計矩陣降秩（多半是交叉表有空 cell）—— type-III 平方和在此無意義。
+
+    繼承 `ValueError` 是為了不打斷既有 `except ValueError` 的呼叫端；
+    要精準攔截就直接 except 這個類別。
+    """
+
+
+class SSDoubleCheckError(ValueError):
+    """平方和雙路徑驗算未通過（08 §三 硬規則 3）。回傳的表不可採信。"""
 
 # ── 門檻常數（全部有出處，改動要同步改 reference）────────────────
 SKEW_LIMIT = 1.0          # 05 §1.1：|skew| >= 1 判高度偏態
@@ -262,6 +299,159 @@ def force_sum_coding(
     return new, notes
 
 
+def _c_var(factor_name: str) -> str | None:
+    """從 patsy 的 factor 名稱（如 `C(a, Sum)`）取回底層欄名 `a`；非 C() 回 None。"""
+    calls = _find_c_calls(factor_name)
+    if not calls:
+        return None
+    start, end, inner = calls[0]
+    if start != 0 or end != len(factor_name):
+        return None
+    return _split_top_level(inner)[0].strip()
+
+
+def design_check(
+    formula: str,
+    data: pd.DataFrame,
+    *,
+    strict: bool = True,
+    min_cell: int = MIN_GROUP_N,
+) -> dict[str, Any]:
+    """**跑 ANOVA 之前**先驗設計矩陣：秩夠不夠、交叉表有沒有空 cell。
+
+    為什麼要事前擋：空 cell 讓 type-III 的對比矩陣降秩，`anova_lm(typ=3)` 不會
+    報錯，只會回一張**每一列 F 與 p 都相同、主效果 SS 等於交互作用 SS** 的表
+    （實測：信用卡 15 類 × 2 地點，3 個空 cell，全表 F=1.122059、p=0.289509）。
+    statsmodels 只在 `wald_test` 內部丟一個 `ValueWarning`，預設會被吞掉。
+
+    回傳 dict：
+      formula_used   改寫成 Sum coding 後的 formula
+      n_cols/rank    設計矩陣欄數與實際秩
+      deficiency     n_cols - rank（0 代表滿秩）
+      rank_deficient bool
+      empty_cells    [{"term":…, "factors":[…], "cells":[(水準…)…], "n_empty":…}]
+      thin_cells     同上，但是 0 < n < min_cell 的細瘦 cell（只警告，不擋）
+      cross_tabs     {term: 交叉表 DataFrame}，給降級時挑要合併的水準用
+      reason         人看的一句話
+
+    實作判斷（reference 未規定）：秩用 `np.linalg.matrix_rank(exog)` 算，
+    因為 `smf.ols(...)` 未 `.fit()` 前 `mod.rank` 是 None。
+    """
+    if not isinstance(data, pd.DataFrame):
+        raise TypeError("data 必須是 pandas.DataFrame —— 先把資料讀成 DataFrame 再進來。")
+
+    used, _ = force_sum_coding(formula, data, strict=strict)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        mod = smf.ols(used, data=data, missing="drop")
+
+    X = np.asarray(mod.exog, dtype=float)
+    n_cols = int(X.shape[1])
+    rank = int(np.linalg.matrix_rank(X)) if X.size else 0
+
+    try:
+        used_rows = data.loc[mod.data.row_labels]
+    except Exception:  # noqa: BLE001
+        used_rows = data
+
+    empty_cells: list[dict[str, Any]] = []
+    thin_cells: list[dict[str, Any]] = []
+    cross_tabs: dict[str, pd.DataFrame] = {}
+    try:
+        terms = list(mod.data.design_info.terms)
+    except Exception:  # noqa: BLE001
+        terms = []
+    for term in terms:
+        names = [_c_var(f.name()) for f in term.factors]
+        if len(names) < 2 or any(v is None or v not in used_rows.columns for v in names):
+            continue
+        cols = [used_rows[v] for v in names]  # type: ignore[index]
+        ct = pd.crosstab(cols[0], cols[1:] if len(cols) > 2 else cols[1])
+        cross_tabs[term.name()] = ct
+        arr = ct.to_numpy()
+        empt: list[tuple] = []
+        thin: list[tuple] = []
+        for i in range(arr.shape[0]):
+            for j in range(arr.shape[1]):
+                combo = (ct.index[i], ct.columns[j])
+                if arr[i, j] == 0:
+                    empt.append(combo)
+                elif arr[i, j] < min_cell:
+                    thin.append(combo)
+        if empt:
+            empty_cells.append({"term": term.name(), "factors": names,
+                                "cells": empt, "n_empty": len(empt)})
+        if thin:
+            thin_cells.append({"term": term.name(), "factors": names,
+                               "cells": thin, "n_thin": len(thin)})
+
+    deficiency = n_cols - rank
+    bits = []
+    if deficiency:
+        bits.append(f"設計矩陣降秩：{n_cols} 欄但秩只有 {rank}（少 {deficiency}）")
+    if empty_cells:
+        tot = sum(e["n_empty"] for e in empty_cells)
+        bits.append(f"交叉表有 {tot} 個空 cell")
+    return {
+        "formula_in": formula,
+        "formula_used": used,
+        "n_cols": n_cols,
+        "rank": rank,
+        "deficiency": deficiency,
+        "rank_deficient": bool(deficiency > 0 or empty_cells),
+        "empty_cells": empty_cells,
+        "thin_cells": thin_cells,
+        "cross_tabs": cross_tabs,
+        "min_cell": min_cell,
+        "n": int(X.shape[0]),
+        "reason": "；".join(bits) if bits else "滿秩、無空 cell",
+    }
+
+
+def _fmt_cells(empty_cells: list[dict[str, Any]], limit: int = 12) -> str:
+    """把空 cell 列表排成人看得懂的多行字串。"""
+    lines = []
+    for e in empty_cells:
+        head = " × ".join(str(f) for f in e["factors"])
+        lines.append(f"    · {e['term']}（{head}）缺 {e['n_empty']} 格：")
+        for combo in e["cells"][:limit]:
+            lines.append("        - " + " × ".join(str(c) for c in combo))
+        if e["n_empty"] > limit:
+            lines.append(f"        - …其餘 {e['n_empty'] - limit} 格省略")
+    return "\n".join(lines)
+
+
+def _rank_deficient_message(diag: dict[str, Any], check: dict[str, Any] | None = None) -> str:
+    """統一的錯誤訊息：哪個設計降秩、差多少、該怎麼辦。"""
+    msg = [
+        f"設計降秩，type-III 平方和不可用 —— formula={diag['formula_used']!r}，n={diag['n']}。",
+        f"  症狀：{diag['reason']}。",
+    ]
+    if diag["empty_cells"]:
+        msg.append("  空 cell（這些組合完全沒有觀測值）：")
+        msg.append(_fmt_cells(diag["empty_cells"]))
+    if check is not None and check.get("passed") is False:
+        msg.append(
+            f"  平方和雙路徑驗算未通過：Type I 逐項和 {check.get('ss_model_plus_resid'):.6f} "
+            f"vs 總平方和 {check.get('ss_total'):.6f}，{check.get('reason')}"
+            f"（08 §三 硬規則 3，容差 {SS_TOL}）。"
+        )
+    msg.append(
+        "  為什麼一定要擋：對比矩陣降秩時 anova_lm(typ=3) 不會報錯，只會回一張"
+        "每一列 F 與 p 都相同、主效果 SS 等於交互作用 SS 的表 —— 那是垃圾，不是結果。"
+    )
+    msg.append(
+        "  怎麼辦（00 §1.6 降級不留空，階梯由前提多到少）：\n"
+        "    ① 合併稀有水準讓每個 cell 都有觀測 → 保住全因子 type-III\n"
+        "    ② 拿掉交互項，改用可估的主效果模型 + Type II（08 §三 硬規則 1 本來就要你優先用 Type II）\n"
+        "    ③ 退成單因子 ANOVA + 事後檢定，交互作用不主張\n"
+        "    ④ 退到底就報 cell 平均數對照表，並明說「本節無法主張交互作用」\n"
+        "    一行做完：anova_degrade(formula, data) 會照這個階梯往下試並回傳降級紀錄；\n"
+        "    真的要看那張不可信的表，顯式傳 allow_rank_deficient=True（回傳表會帶「警告」欄）。"
+    )
+    return "\n".join(msg)
+
+
 def _ss_double_check(model: Any) -> dict[str, Any]:
     """雙路徑驗算：Type I 平方和逐項相加 + 殘差 SS 應等於總 SS（08 §三 硬規則 3）。
 
@@ -270,12 +460,22 @@ def _ss_double_check(model: Any) -> dict[str, Any]:
     """
     out: dict[str, Any] = {"passed": None, "reason": ""}
     try:
-        if not getattr(model.model, "k_constant", 0):
-            out["reason"] = "模型無截距，總平方和定義不同，略過驗算"
-            return out
+        # 有沒有「顯式」的 Intercept 項決定 anova_lm(typ=1) 加總到哪個總平方和。
+        # 不能只看 k_constant：`y ~ 0 + C(g, Sum)` 展開成滿格 dummy 時，欄空間本身
+        # 就含常數，statsmodels 會把 k_constant 判成 1，但 Type I 逐項和加總到的是
+        # **未置中**的總平方和（實測 830.664664 vs centered_tss 733.558331）。
+        # 舊版在這裡誤判成驗算失敗，只是印個 stderr 所以沒人發現；現在會 raise，
+        # 所以必須挑對比較對象。
+        try:
+            has_intercept = any(t.name() == "Intercept"
+                                for t in model.model.data.design_info.terms)
+        except Exception:  # noqa: BLE001
+            has_intercept = bool(getattr(model.model, "k_constant", 0))
         t1 = anova_lm(model, typ=1)
         ss_sum = float(t1["sum_sq"].sum())          # 已含 Residual 列
-        ss_total = float(model.centered_tss)
+        ss_total = (float(model.centered_tss) if has_intercept
+                    else float(np.sum(np.asarray(model.model.endog) ** 2)))
+        out["ss_total_kind"] = "centered_tss" if has_intercept else "uncentered_tss（無顯式截距）"
         gap = abs(ss_sum - ss_total)
         tol = SS_TOL * max(1.0, abs(ss_total))
         out.update(
@@ -299,25 +499,43 @@ def anova3(
     verbose: bool = True,
     cov_type: str | None = None,
     cov_kwds: dict | None = None,
+    allow_rank_deficient: bool = False,
+    min_cell: int = MIN_GROUP_N,
 ) -> pd.DataFrame:
     """強制 sum-to-zero 編碼的 Type III ANOVA，等同 R 的 `car::Anova(m, type=3)` + `contr.sum`。
 
     **直接呼叫 `anova_lm(typ=3)` 會靜默算錯主效果平方和**（18-T3；實測 a 的 SS
     179.76 vs 325.64，少算 45%，不報錯），所以專案內一律走這支，不准繞過。
 
+    **第二個靜默錯誤：設計降秩。** 交叉表只要有一格沒觀測值，type-III 的對比矩陣
+    就降秩，`anova_lm(typ=3)` 照樣回一張表 —— 每一列 F 與 p 都相同、主效果 SS
+    等於交互作用 SS（實測：信用卡 15 類 × 2 地點、3 個空 cell，全表
+    F=1.122059、p=0.289509）。本函式**事前**驗設計矩陣的秩與空 cell，
+    **事後**驗平方和分解，任一關沒過就 raise，不是印個警告讓你自己決定要不要理。
+
     參數
       formula   patsy formula。類別項寫 `C(x)` 即可，本函式會改寫成 `C(x, Sum)`
       data      DataFrame
       strict    True（預設）遇到明寫 treatment/poly 編碼就擋下來；False 代為改寫
-      verbose   改寫或驗算異常時印訊息到 stderr
+      verbose   改寫或細瘦 cell 等非致命狀況時印訊息到 stderr
       cov_type  傳給 `.fit()` 的穩健標準誤（如 "HC3"）。注意：**anova_lm 的
                 type-III 表在穩健共變異數下仍以平方和呈現**，要報穩健檢定請看
                 回傳表 attrs 裡的 model 自行 `wald_test_terms()`（實作判斷）
+      allow_rank_deficient
+                預設 False：降秩或平方和驗算失敗一律 raise。傳 True 才放行，
+                此時回傳表**強制帶一個可見的「警告」欄**，且 attrs["可信"]=False
+      min_cell  cell 樣本數低於此值只警告不擋（預設 16 §8.4 的 MIN_GROUP_N=5）
+
+    例外
+      RankDeficientDesignError  設計降秩（含空 cell）且未顯式放行
+      SSDoubleCheckError        平方和雙路徑驗算未通過且未顯式放行
+      ValueError                formula 用了非 sum-to-zero 編碼／裸露類別欄
 
     回傳
-      DataFrame（sum_sq / df / F / PR(>F) / eta_sq / partial_eta_sq），
-      並在 `.attrs` 帶：
-        formula_in、formula_used、rewrites、model、ss_check、n
+      DataFrame（sum_sq / df / F / PR(>F) / eta_sq / partial_eta_sq；
+      放行降秩時另加「警告」欄），並在 `.attrs` 帶：
+        formula_in、formula_used、rewrites、model、ss_check、n、
+        rank_check、可信、warnings
 
     效果量欄是本檔加的（16 §一：只報 p 是違規）：
       eta_sq         = SS_effect / SS_total（SS_total 用 model.centered_tss）
@@ -330,6 +548,21 @@ def anova3(
     used, notes = force_sum_coding(formula, data, strict=strict)
     if notes and verbose:
         print(f"⚠ anova3 已改寫 formula（18-T3 防呆）：{'；'.join(notes)}", file=sys.stderr)
+
+    # ① 事前：設計矩陣的秩與空 cell —— 降秩就不要跑，跑了也只會拿到垃圾
+    diag = design_check(formula, data, strict=strict, min_cell=min_cell)
+    warn_msgs: list[str] = []
+    if diag["rank_deficient"]:
+        if not allow_rank_deficient:
+            raise RankDeficientDesignError(_rank_deficient_message(diag))
+        warn_msgs.append(
+            f"設計降秩（{diag['reason']}）；type-III 主效果與交互作用 SS 不可解讀，"
+            f"由 allow_rank_deficient=True 顯式放行"
+        )
+    if diag["thin_cells"] and verbose:
+        tot = sum(t["n_thin"] for t in diag["thin_cells"])
+        print(f"⚠ anova3：有 {tot} 個 cell 的 n < {min_cell}（16 §8.4），"
+              f"主效果估計不穩，考慮先合併稀有水準。", file=sys.stderr)
 
     fit_kw: dict[str, Any] = {}
     if cov_type:
@@ -351,14 +584,30 @@ def anova3(
         if "Intercept" in tbl.index:
             tbl.loc["Intercept", col] = np.nan
 
+    # ② 事後：平方和雙路徑驗算（08 §三 硬規則 3）—— 失敗一律 raise，不是印警告
     check = _ss_double_check(model)
-    if check.get("passed") is False and verbose:
-        print(
-            f"⚠ 平方和雙路徑驗算未通過（{check['reason']}）—— "
-            f"08 §三 硬規則 3 要求 SS 分解在 {SS_TOL} 容差內相等。"
-            f"怎麼辦：檢查資料是否有 NaN 被部分丟棄，或 formula 是否含權重／穩健設定。",
-            file=sys.stderr,
-        )
+    if check.get("passed") is False:
+        if not allow_rank_deficient:
+            if diag["rank_deficient"]:
+                raise RankDeficientDesignError(_rank_deficient_message(diag, check))
+            raise SSDoubleCheckError(
+                f"平方和雙路徑驗算未通過 —— formula={used!r}，n={int(model.nobs)}。\n"
+                f"  Type I 逐項和 {check.get('ss_model_plus_resid'):.6f} "
+                f"vs 總平方和 {check.get('ss_total'):.6f}，{check.get('reason')}"
+                f"（08 §三 硬規則 3 要求在 {SS_TOL} 相對容差內相等）。\n"
+                f"  設計矩陣本身是滿秩的（{diag['n_cols']} 欄／秩 {diag['rank']}），"
+                f"所以不是空 cell 造成的。\n"
+                f"  怎麼辦：檢查資料是否有 NaN 被部分丟棄（本函式用 missing=\"drop\"）、"
+                f"formula 是否含權重或穩健設定、y 是否有 inf。\n"
+                f"  確定要看這張不可信的表，顯式傳 allow_rank_deficient=True。"
+            )
+        warn_msgs.append(f"平方和雙路徑驗算未通過（{check['reason']}），SS 分解不成立")
+
+    if warn_msgs:
+        text = "；".join(warn_msgs)
+        tbl["警告"] = text          # 可見欄，不是只有 attrs 裡的暗號
+        if verbose:
+            print(f"⚠ anova3 放行了不可信的結果：{text}", file=sys.stderr)
 
     tbl.attrs.update(
         formula_in=formula,
@@ -366,9 +615,247 @@ def anova3(
         rewrites=notes,
         model=model,
         ss_check=check,
+        rank_check={k: v for k, v in diag.items() if k != "cross_tabs"},
         n=int(model.nobs),
+        警告=warn_msgs,
+        可信=not warn_msgs,
     )
     return tbl
+
+
+def _drop_interactions(formula: str) -> str:
+    """把 `y ~ C(a)*C(b) + x` 化成只剩主效果的加法式。找不到類別項就原樣回傳。"""
+    if "~" not in formula:
+        return formula
+    lhs, rhs = formula.split("~", 1)
+    spans = _find_c_calls(rhs)
+    masked = list(rhs)
+    for s, e, _ in spans:                      # 先把 C(...) 內部遮掉，避免切到括號裡的逗號
+        for i in range(s, e):
+            masked[i] = "\x00"
+    masked_s = "".join(masked)
+
+    spans_top: list[tuple[int, int]] = []      # 頂層以 '+' 切開的項，記位移不記字串
+    depth = 0
+    cur = 0
+    for i, ch in enumerate(masked_s):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "+" and depth == 0:
+            spans_top.append((cur, i))
+            cur = i + 1
+    spans_top.append((cur, len(masked_s)))
+
+    out: list[str] = []
+    for a, b in spans_top:
+        raw, mask = rhs[a:b], masked_s[a:b]
+        if "*" in mask:                        # a*b → 拆成 a + b（保住主效果）
+            cuts, d, c0 = [], 0, 0
+            for i, ch in enumerate(mask):
+                if ch == "(":
+                    d += 1
+                elif ch == ")":
+                    d -= 1
+                elif ch in "*:" and d == 0:
+                    cuts.append(raw[c0:i])
+                    c0 = i + 1
+            cuts.append(raw[c0:])
+            out.extend(s.strip() for s in cuts if s.strip())
+            continue
+        if ":" in mask:                        # 純交互項沒有主效果可留，整項丟掉
+            continue
+        if raw.strip():
+            out.append(raw.strip())
+    seen: list[str] = []
+    for t in out:
+        if t not in seen:
+            seen.append(t)
+    return f"{lhs.strip()} ~ " + " + ".join(seen) if seen else formula
+
+
+def anova_degrade(
+    formula: str,
+    data: pd.DataFrame,
+    *,
+    strict: bool = True,
+    min_cell: int = MIN_GROUP_N,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """設計降秩時的降級階梯（00 §1.6「降級不留空」）—— 一路往下試，回傳降級紀錄。
+
+    階梯（左 → 右＝前提由多到少，只准退一格）：
+
+        ① 全因子 Type III（原方法）
+        ② 合併稀有水準（造成 cell n < min_cell 的水準併成「其他(合併)」）後
+           重跑全因子 Type III —— 保住交互作用，但水準意義變粗
+        ③ 拿掉交互項，主效果模型 + **Type II**
+           （08 §三 硬規則 1 本來就說無交互時預設用 Type II，且不受編碼影響）
+        ④ 退成單因子 ANOVA + 事後檢定（16 §8.4 的 posthoc），交互作用不主張
+        ⑤ 退到底：cell 平均數對照表，明說「本節無法主張任何組間差異」
+
+    ⚠ 為什麼階梯 ③ 不是「同一個降秩模型改跑 Type II」：實測那樣會回**負的平方和**
+    （C(a) SS = −0.003035、C(b) SS = −0.009980），一樣是垃圾。必須先把交互項拿掉
+    讓設計回到滿秩，Type II 才有意義。
+
+    回傳 dict，欄位對齊 00 §1.6 的 `執行紀錄/degradation_log.md` 表：
+      階梯、原方法、失效證據、降級路徑、實際採用、結論弱在哪、
+      table（結果表或 None）、posthoc（階梯④才有）、data_used（階梯②才有）、
+      rank_check、ladder_log（每一格試了什麼、為什麼失敗）
+
+    實作判斷（reference 只給階梯精神，沒指定合併規則）：階梯②合併的是
+    **交互項裡水準數最多的那個因子**，把所有參與 n < min_cell 之 cell 的水準
+    併成單一「其他(合併)」；合併後仍降秩就往 ③ 走。
+    """
+    log: list[str] = []
+    diag = design_check(formula, data, strict=strict, min_cell=min_cell)
+    base = {
+        "原方法": f"全因子 Type III ANOVA（{diag['formula_used']}）",
+        "失效證據": diag["reason"],
+        "rank_check": {k: v for k, v in diag.items() if k != "cross_tabs"},
+    }
+
+    # ── 階梯①：本來就沒問題就直接跑，不叫降級 ───────────────────
+    if not diag["rank_deficient"]:
+        tbl = anova3(formula, data, strict=strict, verbose=verbose, min_cell=min_cell)
+        return {**base, "階梯": 1, "降級路徑": "（未降級）", "實際採用": "全因子 Type III",
+                "結論弱在哪": "無", "table": tbl, "posthoc": None, "data_used": None,
+                "ladder_log": ["① 設計滿秩、無空 cell，照原方法跑"]}
+
+    log.append(f"① 全因子 Type III：擋下 —— {diag['reason']}")
+    if diag["empty_cells"]:
+        log.append("   空 cell：\n" + _fmt_cells(diag["empty_cells"]))
+
+    # ── 階梯②：合併稀有水準 ────────────────────────────────────
+    merged: pd.DataFrame | None = None
+    merge_note = ""
+    for term_name, ct in diag["cross_tabs"].items():
+        arr = ct.to_numpy()
+        rows_bad = [ct.index[i] for i in range(arr.shape[0]) if (arr[i] < min_cell).any()]
+        cols_bad = [ct.columns[j] for j in range(arr.shape[1]) if (arr[:, j] < min_cell).any()]
+        ent = next((e for e in diag["empty_cells"] if e["term"] == term_name), None)
+        if ent is None:
+            continue
+        f_row, f_col = ent["factors"][0], ent["factors"][1]
+        # 併水準數多的那一邊，才不會把二分類因子整個併掉
+        if len(ct.index) >= len(ct.columns):
+            col, bad = f_row, rows_bad
+        else:
+            col, bad = f_col, cols_bad
+        if len(bad) < 2:
+            log.append(f"② 合併稀有水準：跳過 —— {col} 只有 {len(bad)} 個水準要併，併不出東西")
+            continue
+        merged = (merged if merged is not None else data).copy()
+        merged[col] = merged[col].astype(object).where(~merged[col].isin(bad), "其他(合併)")
+        merge_note = (f"{col}：把 {len(bad)} 個水準（{'、'.join(map(str, bad[:6]))}"
+                      f"{'…' if len(bad) > 6 else ''}）併成「其他(合併)」")
+        log.append(f"② 合併稀有水準 → {merge_note}")
+
+    if merged is not None:
+        d2 = design_check(formula, merged, strict=strict, min_cell=min_cell)
+        if not d2["rank_deficient"]:
+            tbl = anova3(formula, merged, strict=strict, verbose=verbose, min_cell=min_cell)
+            log.append(f"② 合併後滿秩（{d2['n_cols']} 欄／秩 {d2['rank']}），全因子 Type III 通過")
+            weak = "被併掉的水準只能整團解讀，不能再對個別水準下結論"
+            if d2["thin_cells"]:
+                thin = "、".join(" × ".join(map(str, c))
+                                 for t in d2["thin_cells"] for c in t["cells"])
+                weak += f"；且仍有 n < {min_cell} 的 cell（{thin}），該格的交互作用估計不穩"
+            if verbose:
+                print("\n".join(log), file=sys.stderr)
+            return {**base, "階梯": 2,
+                    "降級路徑": "全因子 Type III →（合併稀有水準）→ 全因子 Type III",
+                    "實際採用": f"合併稀有水準後的全因子 Type III；{merge_note}",
+                    "結論弱在哪": weak,
+                    "table": tbl, "posthoc": None, "data_used": merged,
+                    "ladder_log": log}
+        log.append(f"② 合併後仍降秩（{d2['reason']}），繼續往下退")
+
+    # ── 階梯③：拿掉交互項 + Type II ────────────────────────────
+    add_formula = _drop_interactions(formula)
+    if add_formula != formula:
+        add_used, _ = force_sum_coding(add_formula, data, strict=strict)
+        d3 = design_check(add_formula, data, strict=strict, min_cell=min_cell)
+        if not d3["rank_deficient"]:
+            model = smf.ols(add_used, data=data, missing="drop").fit()
+            chk = _ss_double_check(model)
+            if chk.get("passed") is not False:
+                tbl = anova_lm(model, typ=2).copy()
+                ss_resid = float(tbl.loc["Residual", "sum_sq"])
+                ss_total = float(model.centered_tss)
+                tbl["eta_sq"] = tbl["sum_sq"] / ss_total
+                tbl["partial_eta_sq"] = tbl["sum_sq"] / (tbl["sum_sq"] + ss_resid)
+                for c in ("eta_sq", "partial_eta_sq"):
+                    tbl.loc["Residual", c] = np.nan
+                tbl.attrs.update(formula_in=formula, formula_used=add_used, model=model,
+                                 ss_check=chk, n=int(model.nobs), typ=2,
+                                 rank_check={k: v for k, v in d3.items() if k != "cross_tabs"},
+                                 可信=True)
+                log.append(f"③ 拿掉交互項 → {add_used}，滿秩（{d3['n_cols']} 欄／秩 {d3['rank']}），"
+                           f"Type II 通過（SS 驗算差 {chk.get('abs_gap', 0):.3g}）")
+                if verbose:
+                    print("\n".join(log), file=sys.stderr)
+                return {**base, "階梯": 3,
+                        "降級路徑": "全因子 Type III → 主效果模型 + Type II",
+                        "實際採用": f"anova_lm(typ=2) on {add_used}",
+                        "結論弱在哪": "只能主張主效果，**不能主張交互作用**"
+                                    "（空 cell 讓交互項不可估，不是「檢定不顯著」）",
+                        "table": tbl, "posthoc": None, "data_used": None,
+                        "ladder_log": log}
+            log.append(f"③ 主效果模型的 SS 驗算沒過（{chk.get('reason')}），繼續往下退")
+        else:
+            log.append(f"③ 主效果模型仍降秩（{d3['reason']}），繼續往下退")
+
+    # ── 階梯④：單因子 ANOVA + 事後檢定 ──────────────────────────
+    dv = formula.split("~", 1)[0].strip()
+    factors = [v for v in (_c_var(f"C({inner})") for _, _, inner in _find_c_calls(formula))
+               if v and v in data.columns]
+    seen_f: list[str] = []
+    for f in factors:
+        if f not in seen_f:
+            seen_f.append(f)
+    one: dict[str, Any] = {}
+    for f in seen_f:
+        try:
+            sub = data[[dv, f]].dropna()
+            one[f] = {
+                "anova": anova3(f"{dv} ~ C({f})", sub, strict=strict,
+                                verbose=False, min_cell=min_cell),
+                "posthoc": posthoc(sub, dv=dv, group=f),
+            }
+        except Exception as e:  # noqa: BLE001
+            one[f] = {"error": repr(e)}
+    ok = [f for f, r in one.items() if "error" not in r]
+    if ok:
+        log.append(f"④ 退成單因子 ANOVA + 事後檢定：{'、'.join(ok)} 各跑一次，交互作用不主張")
+        if verbose:
+            print("\n".join(log), file=sys.stderr)
+        return {**base, "階梯": 4,
+                "降級路徑": "全因子 Type III → 主效果模型 + Type II → 單因子 ANOVA + 事後檢定",
+                "實際採用": f"對 {'、'.join(ok)} 各跑一次單因子 ANOVA，事後檢定依 16 §8.4 自動選",
+                "結論弱在哪": "各因子各自解讀，不能主張任一因子的效果在另一因子的水準間不同",
+                "table": {f: one[f]["anova"] for f in ok},
+                "posthoc": {f: one[f]["posthoc"] for f in ok},
+                "data_used": None, "ladder_log": log}
+
+    # ── 階梯⑤：敘述統計對照表，章節保留（18-E11 不准刪章）────────
+    cells = list(diag["cross_tabs"].values())
+    desc = None
+    if seen_f:
+        try:
+            desc = data.groupby(seen_f, dropna=False)[dv].agg(["count", "mean", "median", "std"])
+        except Exception:  # noqa: BLE001
+            desc = None
+    log.append("⑤ 退到底：只報 cell 平均數對照表，本節無法主張任何組間差異")
+    if verbose:
+        print("\n".join(log), file=sys.stderr)
+    return {**base, "階梯": 5,
+            "降級路徑": "全因子 Type III → Type II → 單因子 ANOVA → 敘述統計對照表",
+            "實際採用": "cell 平均數／中位數／n 對照表",
+            "結論弱在哪": "完全不能做推論；章節保留但要明說「本節無法主張組間差異」（18-E11）",
+            "table": desc if desc is not None else (cells[0] if cells else None),
+            "posthoc": None, "data_used": None, "ladder_log": log}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1669,6 +2156,153 @@ def _selftest_anova3() -> None:
             _err(f"anova3 對「{what}」丟出非預期例外", repr(e))
 
 
+def _selftest_anova3_balanced() -> None:
+    """18-T3 在**平衡設計**上一樣成立 —— 差異的來源是交互作用，不是不平衡。
+
+    完全平衡的 2×2，a 的效果在 b1 是 +2.0、在 b2 是 −1.6634（近乎交叉），
+    平均下來主效果只剩 0.168。treatment coding 的 type-III 測的是「b 參照水準上的
+    單純效果」，所以 SS 會大到跟真主效果差兩個數量級。
+    """
+    rng = np.random.default_rng(20260727)
+    n = 2088
+    cells = {("a1", "b1"): 0.0, ("a2", "b1"): 2.0,
+             ("a1", "b2"): 0.0, ("a2", "b2"): -1.6634}
+    df = pd.concat(
+        [pd.DataFrame({"a": A, "b": B, "y": rng.normal(m, 1.275, n)})
+         for (A, B), m in cells.items()],
+        ignore_index=True,
+    )
+    ct = pd.crosstab(df["a"], df["b"]).to_numpy()
+    if ct.min() != ct.max():
+        _err("平衡設計 fixture 不平衡", f"cell 次數 {ct.tolist()}")
+        return
+
+    try:
+        bare = anova_lm(smf.ols("y ~ C(a)*C(b)", df, missing="drop").fit(), typ=3)
+        right = anova3("y ~ C(a)*C(b)", df, verbose=False)
+    except Exception as e:  # noqa: BLE001
+        _err("平衡設計上的 18-T3 對照跑失敗", repr(e))
+        return
+
+    sb, fb = float(bare.loc["C(a)", "sum_sq"]), float(bare.loc["C(a)", "F"])
+    sr, fr = float(right.loc["C(a, Sum)", "sum_sq"]), float(right.loc["C(a, Sum)", "F"])
+    ratio = sb / sr if sr else float("inf")
+    infos.append(f"  · 平衡 2×2（每 cell n={n}，交叉型交互作用）")
+    infos.append(f"  · 裸 anova_lm(typ=3) C(a)：SS={sb:10.2f}  F={fb:9.2f}")
+    infos.append(f"  · anova3          C(a, Sum)：SS={sr:10.2f}  F={fr:9.2f}  → 差 {ratio:.1f} 倍")
+
+    if ratio < 10:
+        _err("平衡設計上 anova3 與裸 anova_lm(typ=3) 差不到 10 倍",
+             f"實際 {ratio:.2f} 倍。防呆失去驗證依據；"
+             "怎麼辦：確認 force_sum_coding 還有沒有真的改寫，或 statsmodels 換了預設編碼")
+    else:
+        _ok(f"平衡設計上 18-T3 仍抓得到差異（C(a) SS 差 {ratio:.1f} 倍）")
+
+    if right.attrs["可信"] and "警告" not in right.columns:
+        _ok("滿秩平衡設計不會被降秩防呆誤擋（無「警告」欄、可信=True）")
+    else:
+        _err("滿秩平衡設計被降秩防呆誤擋", str(right.attrs.get("警告")))
+
+
+def _mk_rank_deficient() -> pd.DataFrame:
+    """仿實測案例：15 類 × 2 類，其中 3 類完全沒有第二種水準 → 3 個空 cell。"""
+    rng = np.random.default_rng(20260727)
+    lv_a = [f"{i:02d}_類{i}" for i in range(1, 16)]
+    missing = {lv_a[4], lv_a[12], lv_a[14]}      # 對應 05／13／X2 三類沒有國外列
+    rows = []
+    for i, A in enumerate(lv_a):
+        rows.append(pd.DataFrame({"a": A, "b": "國內",
+                                  "y": rng.normal(7 + 0.1 * i, 1.2, 400)}))
+        if A not in missing:
+            rows.append(pd.DataFrame({"a": A, "b": "國外",
+                                      "y": rng.normal(7.4 + 0.1 * i, 1.2, 30)}))
+    return pd.concat(rows, ignore_index=True)
+
+
+def _selftest_rank_guard() -> None:
+    """降秩設計必須被擋下來，而且要擋在「回傳垃圾」之前（實測 18-T3 的第二個坑）。"""
+    df = _mk_rank_deficient()
+
+    # 1) 事前偵測：秩與空 cell 都要點名
+    try:
+        d = design_check("y ~ C(a)*C(b)", df)
+    except Exception as e:  # noqa: BLE001
+        _err("design_check 跑失敗", repr(e))
+        return
+    combos = [c for e in d["empty_cells"] for c in e["cells"]]
+    infos.append(f"  · 降秩 fixture：設計矩陣 {d['n_cols']} 欄／秩 {d['rank']}，"
+                 f"空 cell {len(combos)} 格 → {'、'.join(' × '.join(map(str, c)) for c in combos)}")
+    if d["rank_deficient"] and d["deficiency"] == 3 and len(combos) == 3:
+        _ok("design_check 事前抓到降秩與 3 個空 cell，並列出是哪些組合")
+    else:
+        _err("design_check 沒抓到降秩",
+             f"deficiency={d['deficiency']}、空 cell={combos}。"
+             "怎麼辦：確認 np.linalg.matrix_rank 是否被 exog 的 NaN 干擾")
+
+    # 2) 預設一定要 raise —— 不是印 stderr
+    try:
+        tbl = anova3("y ~ C(a)*C(b)", df, verbose=False)
+        bad = tbl.loc["C(a, Sum)", "F"] == tbl.loc["C(a, Sum):C(b, Sum)", "F"]
+        _err("anova3 沒擋住降秩設計",
+             f"回傳了表（主效果 F 與交互作用 F 相同={bool(bad)}），"
+             "這正是實測回報的靜默垃圾；怎麼辦：檢查 anova3 的事前 design_check 分支")
+    except RankDeficientDesignError as e:
+        must = ["空 cell", "anova_degrade", "allow_rank_deficient", "Type II"]
+        miss = [m for m in must if m not in str(e)]
+        if miss:
+            _warn("RankDeficientDesignError 訊息缺少關鍵字", f"缺 {miss}")
+        else:
+            _ok("anova3 對降秩設計 raise RankDeficientDesignError（訊息含空 cell 清單與降級路徑）")
+    except Exception as e:  # noqa: BLE001
+        _err("anova3 對降秩設計丟出非預期例外", repr(e))
+
+    # 3) 顯式放行時，回傳表必須帶可見的警告欄
+    try:
+        t = anova3("y ~ C(a)*C(b)", df, verbose=False, allow_rank_deficient=True)
+        if "警告" in t.columns and t.attrs["可信"] is False and t.attrs["警告"]:
+            _ok("allow_rank_deficient=True 放行，但回傳表帶可見「警告」欄且 attrs['可信']=False")
+        else:
+            _err("放行時沒有把失敗寫進可見欄位",
+                 f"columns={list(t.columns)}、可信={t.attrs.get('可信')}")
+    except Exception as e:  # noqa: BLE001
+        _err("allow_rank_deficient=True 仍然擋下來", repr(e))
+
+    # 4) 降級路徑要真的跑得出可信的東西（00 §1.6 降級不留空）
+    for mc, want in ((MIN_GROUP_N, (2, 3)), (1, (3, 4))):
+        try:
+            r = anova_degrade("y ~ C(a)*C(b)", df, min_cell=mc, verbose=False)
+        except Exception as e:  # noqa: BLE001
+            _err(f"anova_degrade（min_cell={mc}）跑失敗", repr(e))
+            continue
+        t = r["table"]
+        trust = isinstance(t, pd.DataFrame) and t.attrs.get("可信") is True
+        infos.append(f"  · anova_degrade(min_cell={mc}) → 階梯 {r['階梯']}：{r['實際採用']}")
+        if r["階梯"] in want and trust and r["結論弱在哪"] and r["失效證據"]:
+            _ok(f"anova_degrade（min_cell={mc}）退到階梯 {r['階梯']}，"
+                f"結果可信且四件事（原方法／失效證據／實際採用／結論弱在哪）齊全")
+        else:
+            _err(f"anova_degrade（min_cell={mc}）降級結果不合格",
+                 f"階梯={r['階梯']}（預期 {want}）、可信={trust}、"
+                 f"結論弱在哪={r['結論弱在哪']!r}")
+
+    # 5) 無顯式截距不可被誤判成驗算失敗（驗算失敗改成 raise 之後才會咬人）
+    rng = np.random.default_rng(7)
+    d0 = pd.DataFrame({"g": rng.choice(list("ABC"), 400)})
+    d0["y"] = (d0["g"] == "A") * 2.0 + rng.normal(0, 1, 400)
+    try:
+        t0 = anova3("y ~ 0 + C(g)", d0, verbose=False)
+        kind = t0.attrs["ss_check"].get("ss_total_kind", "")
+        if t0.attrs["ss_check"]["passed"] and "uncentered" in kind:
+            _ok("無顯式截距的模型改用未置中總平方和比對，不再誤判為驗算失敗")
+        else:
+            _err("無顯式截距的 SS 驗算判斷不對",
+                 f"passed={t0.attrs['ss_check']['passed']}、比對對象={kind!r}")
+    except SSDoubleCheckError as e:
+        _err("無顯式截距的模型被誤判成驗算失敗", str(e).splitlines()[0])
+    except Exception as e:  # noqa: BLE001
+        _err("無顯式截距的模型丟出非預期例外", repr(e))
+
+
 def _selftest_rest() -> None:
     rng = np.random.default_rng(20260727)
 
@@ -1840,26 +2474,27 @@ def _selftest_rest() -> None:
 
 
 def _main() -> int:
-    ap = argparse.ArgumentParser(
+    ap = GateArgumentParser(
         description="統計推論工具（type-III ANOVA／事後檢定／效果量）的自我檢查",
         epilog="本檔是純函式庫，不讀專案資料，所以沒有「專案代號」位置參數。",
     )
-    ap.add_argument("--selftest", action="store_true",
+    ap.add_argument("--self-test", action="store_true",
                     help="跑內建斷言（含 anova3 vs anova_lm(typ=3) 的差異驗證）")
     ap.add_argument("--verbose", action="store_true", help="連通過項也列出")
     args = ap.parse_args()
 
-    if not args.selftest:
+    if not args.self_test:
         print(__doc__)
-        print("要驗證安裝是否正確：python stats_utils.py --selftest --verbose")
-        return 0
+        print("要驗證安裝是否正確：python stats_utils.py --self-test --verbose")
+        return EX_OK
 
     print("=" * 68)
     print("stats_utils —— 自我檢查")
     print("=" * 68)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        for fn in (_selftest_anova3, _selftest_rest):
+        for fn in (_selftest_anova3, _selftest_anova3_balanced,
+                   _selftest_rank_guard, _selftest_rest):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001
@@ -1887,13 +2522,22 @@ def _main() -> int:
     n_ok = sum(1 for m in infos if not m.startswith("  "))
     if errors:
         print(f"結果：{len(errors)} 個 error、{len(warnings_)} 個 warning → 不可使用")
-        return 1
+        return EX_ERROR
     if warnings_:
         print(f"結果：{len(warnings_)} 個 warning → 可用，部分路徑要留意（通過 {n_ok} 項）")
-        return 2
+        return EX_WARN
     print(f"結果：全部通過（{n_ok} 項）→ 可用")
-    return 0
+    return EX_OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(_main())
+    try:
+        raise SystemExit(_main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"⛔ stats_utils.py 本身失敗：{type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        print(f"   → 退出碼 {EX_SOFTWARE}（腳本自身異常）。修腳本（00 §八）。",
+              file=sys.stderr)
+        raise SystemExit(EX_SOFTWARE) from exc

@@ -35,8 +35,10 @@ M1 資料剖析 —— 進場第一支腳本，把「這批資料到底是什麼
   · 落檔    → 開案與問題定義/欄位總表.csv（T1，欄位就是 04 §二 的 COLUMN_PROFILE_SCHEMA）
               開案與問題定義/資料剖析.json
               開案與問題定義/資料剖析報告.txt
-  · 退出碼  → 0 通過｜1 有 error（擋住，不准進 M2）｜2 只有 warning｜3 腳本本身失敗
-              與 setup_check.py、check_data_quality.py、verify_outputs 同一套，不准對調。
+  · 退出碼  → 0 通過｜1 有 error（擋住，不准進 M2）｜2 只有 warning
+              ｜64 用法錯誤（旗標打錯、缺專案代號）｜70 腳本本身失敗
+              全庫統一，權威定義見 00 §八。與 setup_check.py、check_data_quality.py、
+              verify_outputs 同一套，不准對調。
 
 用法：
     python profile_dataset.py 2026Q3_信用卡                      # 掃專案的 原始資料/
@@ -60,8 +62,9 @@ M1 資料剖析 —— 進場第一支腳本，把「這批資料到底是什麼
     與 Q2 同一類「不報錯但結論全錯」的污染。
   · practical_use（04 §二 的招牌欄）由欄名與型別自動推定，一律標記「需人工確認」。
     自動推定不算數，04 §二 說得很清楚：填不出來代表這欄還沒被想清楚。
-  · 「沒有檔案可剖析」「指定的檔案不存在」判 error（退出碼 1）而非 3。退出碼 3 依
-    04 §四 只代表「檢查腳本本身失敗」，留給最外層的例外處理，不拿來表示使用者失誤。
+  · 「沒有檔案可剖析」「指定的檔案不存在」判 error（退出碼 1）而非 70。退出碼 70 依
+    00 §八 只代表「腳本本身失敗」，留給最外層的例外處理，不拿來表示使用者失誤；
+    使用者失誤（旗標打錯、缺必填參數）走 64。
   · --no-pivot-clean 只停止「剔除」，不停止「偵測」：命中仍然是 error，並額外註明
     本次所有統計量都含那幾列。實測對照（Step 4 的 Sum of Weight）：
       剔除 max = 50,403、mean = 3,096.16｜保留 max = 306,520、mean = 6,130.40
@@ -84,6 +87,10 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from demographic_vars import classify_demographic  # noqa: E402
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_SOFTWARE, GateArgumentParser,
+)
 from paths import project_dir  # noqa: E402
 
 if sys.platform == "win32":
@@ -137,10 +144,8 @@ FULLWIDTH_RE = re.compile(r"[！-～　]")
 # ── 04 §二：分群輸入白名單（見 18-E2，只能是行為指標）────────────────
 SEGMENT_NAME_RE = re.compile(r"^(r|f|m|rfm.*|cai|cri|ln_[fm]|factor.*|f\d+)$", re.IGNORECASE)
 # ── 04 §二：人口統計變數只能 profile_only，不准進分群（見 18-E2）──────
-DEMOGRAPHIC_NAME_RE = re.compile(
-    r"(年齡|age|性別|gender|sex|生日|birth|居住地|地區|城市|region|city|zip|"
-    r"教育|education|婚姻|marital|職業|occupation|job|所得|收入|income|學歷)",
-    re.IGNORECASE)
+# 清單在 scripts/demographic_vars.py：這裡的判定與 prep_cluster_matrix.py 的
+# 18-E2 白名單、build_features.py 的 CRI 血緣是同一件事，只能有一份清單。
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -171,10 +176,10 @@ class Buckets:
 
     def gate(self) -> int:
         if self.error:
-            return 1
+            return EX_ERROR
         if self.warning:
-            return 2
-        return 0
+            return EX_WARN
+        return EX_OK
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -490,7 +495,7 @@ def _practical_use(name: str, s: pd.Series, is_id: bool, is_helper: bool,
             return "subject_key"
         return "subject_key" if is_pk_part and is_id else "fk"
     # 人口統計變數優先於一切 —— 18-E2：它們只能出現在卡方那一章，不准進分群
-    if DEMOGRAPHIC_NAME_RE.search(name):
+    if classify_demographic(name) is not None:
         return "profile_only"
     # segment_input 必須是數值型的行為指標；名字叫 CAI 但值是 Present/Missing 的
     # 旗標欄不算（課程檔的客戶檔就有這一欄）
@@ -1154,9 +1159,9 @@ def render_report(payload: dict[str, Any], bk: Buckets, brief: bool) -> str:
     L.append("")
     L.append("=" * W)
     code = payload["退出碼"]
-    verdict = {0: "✅ 三桶無 error 無 warning → 可進 M2",
-               1: "⛔ 有 error → 擋住，必須在 contracts/<source>.yml 宣告處理方式後重跑",
-               2: "⚠ 只有 warning → 可進 M2，warning 條目必須進報告的「資料限制」節"}[code]
+    verdict = {EX_OK: "✅ 三桶無 error 無 warning → 可進 M2",
+               EX_ERROR: "⛔ 有 error → 擋住，必須在 contracts/<source>.yml 宣告處理方式後重跑",
+               EX_WARN: "⚠ 只有 warning → 可進 M2，warning 條目必須進報告的「資料限制」節"}[code]
     L.append(f"結果：error {len(bk.error)}｜warning {len(bk.warning)}｜info {len(bk.info)}"
              f"　退出碼 {code}")
     L.append(verdict)
@@ -1185,7 +1190,7 @@ def collect_inputs(args: argparse.Namespace, p: Any, bk: Buckets) -> list[Path]:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(
+    ap = GateArgumentParser(
         description="M1 資料剖析：逐欄剖析 + 粒度主鍵判定 + 哨兵值與樞紐雜訊列掃描",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("project", help="專案代號（路徑由 paths.project_dir 解析）")
@@ -1241,7 +1246,7 @@ def main() -> int:
         files_payload.append(entry)
     else:
         inputs = collect_inputs(args, p, bk)
-        # 沒東西可剖析是 error（擋住），不是退出碼 3 —— 3 只留給腳本自己爆掉
+        # 沒東西可剖析是 error（擋住），不是退出碼 70 —— 70 只留給腳本自己爆掉
         if not inputs and not bk.error:
             bk.add("error", "無輸入", args.project,
                    f"專案「{args.project}」的 {p.raw} 是空的，也沒有在命令列指定檔案",
@@ -1355,6 +1360,7 @@ if __name__ == "__main__":
         raise
     except Exception as exc:  # noqa: BLE001
         print(f"⛔ profile_dataset.py 本身失敗：{type(exc).__name__}: {exc}\n"
-              f"   → 這是退出碼 3（腳本失敗），不是資料有問題。修腳本，不准手動略過。",
+              f"   → 這是退出碼 {EX_SOFTWARE}（腳本自身異常），不是資料有問題。"
+              f"修腳本，不准手動略過（00 §八）。",
               file=sys.stderr)
-        raise SystemExit(3) from exc
+        raise SystemExit(EX_SOFTWARE) from exc

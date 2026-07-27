@@ -14,13 +14,17 @@ M6 分群矩陣前處理 —— build_features 之後、任何分群之前的**�
     描述去發展」（IB5082 第一講 P26）。
   · **CRI 血緣**：CRI 的分母含「該顧客所屬先驗群的群內變異數」。先驗群若用
     人口變數分，交易紀錄完全相同的兩人也會拿到不同 CRI —— 等於把人口變數
-    以非線性編碼偷渡進矩陣（07 §3.1）。
+    以非線性編碼偷渡進矩陣（07 §3.1）。這一關**讀資料**：血緣由
+    build_features.py 寫進特徵表，不是靠 spec 填一個字串自我宣告。
 
 做六件事（對應 07 §3.1／§3.3／§四）：
   1. 白名單檢查 —— 只准 R / F / M / RFM Score / CAI / CRI / 因素分數 /
      LN_F / LN_M。人口變數一律擋下（18-E2）→ error
-  2. CRI 血緣檢查 —— cluster_spec.json 的 cri_prior_type 必須是 behavioral，
-     否則 CRI 不得進矩陣（07 §3.1）→ error
+  2. CRI 血緣檢查 —— **以特徵表裡的血緣欄位為準**（build_features.py 落的
+     prior_group_type / prior_group_cols / prior_group_demographic_cols）。
+     先驗群欄位會用 demographic_vars.py 的人口變數清單重判，不是 behavioral
+     就擋下。cluster_spec.json 的 cri_prior_type 降級成交叉檢查，
+     與資料不一致（或沒填）→ error（07 §3.1）
   3. 偏度檢查 —— |skew| > 1 依欄位性質轉換（見下方轉換政策），轉換後複檢
      偏度與 Spearman 排序相關 > 0.95（07 §四 關卡 2、06 §6.1）
   4. 標準化 —— z-score，fit 在**整個分析集**（非監督沒有 train/test，
@@ -44,10 +48,12 @@ M6 分群矩陣前處理 —— build_features 之後、任何分群之前的**�
   | 因素分數            | 不轉換、也不 z-score   | 因素分析輸出本身即為標準分數 |
   log1p 後仍 |skew| > 1 → 再退回 NTILE(5)。
 
-三桶 + 退出碼（沿用 setup_check.py 的語意）：
-    0 = 全通過，矩陣已寫出
-    1 = 有 error，**不產出矩陣**，M6 不准往下走
-    2 = 只有 warning，矩陣已寫出但報告必須寫理由
+三桶 + 退出碼（全庫統一，權威定義見 00 §八）：
+    0  = 全通過，矩陣已寫出
+    1  = 有 error，**不產出矩陣**，M6 不准往下走
+    2  = 只有 warning，矩陣已寫出但報告必須寫理由
+    64 = 用法錯誤（旗標打錯、缺專案代號）—— 矩陣根本沒開始算
+    70 = 腳本自身異常
 
 用法：
     python prep_cluster_matrix.py <專案代號> --input <顧客特徵表.parquet>
@@ -68,7 +74,6 @@ M6 分群矩陣前處理 —— build_features 之後、任何分群之前的**�
 
 from __future__ import annotations
 
-import argparse
 import json
 import re
 import sys
@@ -80,6 +85,12 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_SOFTWARE, GateArgumentParser,
+)
+from demographic_vars import (  # noqa: E402
+    PRIOR_BEHAVIORAL, PRIOR_NONE, PRIOR_TYPES, classify_blacklist,
+    classify_prior_cols, describe_prior_cols)
 from paths import SKILL_ROOT, project_dir  # noqa: E402
 
 if sys.platform == "win32":
@@ -128,19 +139,9 @@ WHITELIST: list[tuple[str, re.Pattern[str], str]] = [
     ("M", re.compile(r"^m$|^ln_m$|^log_m$|^m_.+$|^monetary.*$"), "log"),
 ]
 
-# 07 §3.1「明確禁止」那一行。先比對這張表，才給得出有用的錯誤訊息。
-BLACKLIST: list[tuple[str, re.Pattern[str]]] = [
-    ("性別", re.compile(r"(^|_)(gender|sex|性別)($|_)")),
-    ("年齡", re.compile(r"(^|_)(age|birth|birthday|年齡|年紀|生日)($|_)")),
-    ("婚姻", re.compile(r"(^|_)(marital|marriage|婚姻)($|_)")),
-    ("地區", re.compile(r"(^|_)(region|area|city|district|county|地區|縣市|居住地|年收地)($|_)")),
-    ("郵遞區號", re.compile(r"(^|_)(zip|zipcode|postal|postcode|郵遞區號)($|_)")),
-    ("教育程度", re.compile(r"(^|_)(edu|education|degree|教育程度|學歷)($|_)")),
-    ("職業", re.compile(r"(^|_)(job|occupation|職業)($|_)")),
-    ("卡別", re.compile(r"(^|_)(card_type|card_grade|cardtype|卡別)($|_)")),
-    ("會員等級", re.compile(r"(^|_)(member_level|membership|tier|grade|會員等級|等級)($|_)")),
-    ("M5 標籤", re.compile(r"(^|_)(label|tag|segment|flag|標籤)($|_)")),
-]
+# 07 §3.1「明確禁止」那一行 → scripts/demographic_vars.py。
+# 清單刻意不寫在這裡：18-E2 的白名單檢查與 07 §3.1 的 CRI 血緣判定必須用
+# 同一份人口變數清單，各寫一份就是給人繞過的破口（見該檔開頭的理由）。
 
 # 分位分箱的分位點。06 §六 對 r_days_since_last_sale 的裁定是 NTILE(5)
 NTILE_QUANTILES = (0.2, 0.4, 0.6, 0.8)
@@ -204,11 +205,7 @@ def classify_var(name: str) -> tuple[str, str] | None:
 
 
 def blacklist_hit(name: str) -> str | None:
-    low = name.strip().lower()
-    for cat, pat in BLACKLIST:
-        if pat.search(low):
-            return cat
-    return None
+    return classify_blacklist(name)
 
 
 def check_whitelist(input_vars: list[str]) -> dict[str, tuple[str, str]]:
@@ -244,32 +241,142 @@ def check_whitelist(input_vars: list[str]) -> dict[str, tuple[str, str]]:
 
 
 # ── (2) CRI 血緣檢查（07 §3.1）────────────────────────────
-def check_cri_lineage(classified: dict[str, tuple[str, str]], spec: dict[str, Any]) -> None:
+LINEAGE_COLS = ("prior_group_type", "prior_group_cols",
+                "prior_group_demographic_cols")
+
+
+def read_data_lineage(df: pd.DataFrame) -> dict[str, str] | None:
+    """從特徵表讀 build_features 落下的血緣欄位。沒有這幾欄就回 None。
+
+    這三欄是常數欄（每列相同）。出現多個值代表這張表是兩批不同先驗群的
+    特徵表拼起來的 —— 那本身就是要擋的狀況，交給呼叫端報 error。
+    """
+    if not all(c in df.columns for c in LINEAGE_COLS):
+        return None
+    out: dict[str, str] = {}
+    for c in LINEAGE_COLS:
+        vals = {("" if pd.isna(v) else str(v)) for v in df[c].unique()}
+        out[c] = ("＜多值＞" + "／".join(sorted(vals))) if len(vals) > 1 else (
+            vals.pop() if vals else "")
+    return out
+
+
+def check_cri_lineage(classified: dict[str, tuple[str, str]], spec: dict[str, Any],
+                      df: pd.DataFrame) -> None:
+    """CRI 能不能進矩陣，**以資料裡的血緣為準**（07 §3.1）。
+
+    舊版只看 cluster_spec.json 的 cri_prior_type，那是自我宣告 ——
+    先驗群明明用性別分，spec 打 "behavioral" 就能過關。現在的順序是：
+      1. 讀特徵表的 prior_group_cols，用共用清單（demographic_vars.py）**重新判定**；
+      2. spec 的 cri_prior_type 只當交叉檢查，不一致 → error 並列出兩邊各說什麼；
+      3. 資料判定不是 behavioral → error，不管 spec 寫什麼。
+    """
     cri_vars = [v for v, (cat, _) in classified.items() if cat == "CRI"]
     if not cri_vars:
         ok("input_vars 不含 CRI，血緣檢查不適用")
         return
 
-    prior = spec.get("cri_prior_type")
-    if prior is None:
-        err(f"input_vars 含 CRI（{', '.join(cri_vars)}）但 cluster_spec.json 沒有 "
-            f"cri_prior_type",
-            "CRI 的分母含先驗群的群內變異數 τ²_g，先驗群用什麼分會直接決定 CRI 的值。"
-            "在 spec 補上 cri_prior_type：\"behavioral\"（行為分層，如 F 三分位／"
-            "品類廣度）或 \"demographic\"（人口變數）")
+    cri_txt = ", ".join(cri_vars)
+    spec_prior = spec.get("cri_prior_type")
+    spec_txt = str(spec_prior).strip().lower() if spec_prior is not None else None
+
+    data = read_data_lineage(df)
+    if data is None:
+        # 舊版 build_features 產的表。只剩自我宣告可用 —— 照舊擋 demographic，
+        # 但必須講明白這一關現在是沒有牙齒的。
+        warn(f"輸入資料沒有血緣欄位（{', '.join(LINEAGE_COLS)}），"
+             f"CRI 血緣只能採信 cluster_spec.json 的自我宣告",
+             "這張特徵表是舊版 build_features 產的。自我宣告攔不到填錯或亂填 —— "
+             "用現在的 build_features.py 重跑一次特徵表，血緣才會跟著資料走（07 §3.1）")
+        if spec_txt is None:
+            err(f"input_vars 含 CRI（{cri_txt}）但 cluster_spec.json 的 "
+                f"cri_prior_type 沒填（缺這個鍵，或值是 null）",
+                "CRI 的分母含先驗群的群內變異數 τ²_g，先驗群用什麼分會直接決定 CRI 的值。"
+                "把 spec 的 cri_prior_type 填成 \"behavioral\"（行為分層，如 F 三分位／"
+                "品類廣度）或 \"demographic\"（人口變數）—— 看你跑 build_features.py 時 "
+                "--prior-group-cols 給的是哪一種欄位，誠實填")
+        elif spec_txt != PRIOR_BEHAVIORAL:
+            err(f"CRI 的先驗群是 {spec_prior}（spec 自我宣告），不得進分群矩陣",
+                "07 §3.1：先驗群用人口變數時，交易紀錄完全相同的兩人也會因人口欄不同"
+                "拿到不同 CRI（同一個 s²/n 下 CRI 差到 21.4 vs 79.1）。"
+                "把 CRI 從 input_vars 拿掉，或先驗群改用行為分層重算")
+        else:
+            ok(f"CRI 血緣（僅自我宣告）：cri_prior_type = behavioral（{cri_txt}）")
         return
 
-    if str(prior).lower() != "behavioral":
-        err(f"CRI 的先驗群是 {prior}，不得進分群矩陣",
-            "07 §3.1：先驗群用人口變數時，交易紀錄完全相同的兩人也會因人口欄不同"
-            "拿到不同 CRI（同一個 s²/n 下 CRI 差到 21.4 vs 79.1），等於把人口變數"
-            "以非線性編碼送進矩陣。做法二選一：(a) 把 CRI 從 input_vars 拿掉；"
-            "(b) 先驗群改用行為分層重算 CRI，再把 cri_prior_type 改成 behavioral。"
-            "另外，07 §8.4 排除條款：那批先驗人口變數也不得進卡方表")
+    recorded = data["prior_group_type"]
+    cols_raw = data["prior_group_cols"]
+
+    if recorded.startswith("＜多值＞") or cols_raw.startswith("＜多值＞"):
+        err(f"輸入資料的血緣欄位有多個值（prior_group_type = {recorded}，"
+            f"prior_group_cols = {cols_raw}）",
+            "同一張特徵表裡混了兩批不同先驗群算出來的 CRI，它們不在同一個尺度上。"
+            "分開跑 build_features.py，不要把兩批 concat 起來再分群")
         return
 
-    ok(f"CRI 血緣通過：cri_prior_type = behavioral（{', '.join(cri_vars)}）")
-    detail(infos, "07 §8.4 排除條款仍要人工確認：先驗群用到的欄位不得進卡方表")
+    cols = [c for c in cols_raw.split(",") if c]
+    if cols:
+        effective, _demo = classify_prior_cols(cols)
+    else:
+        effective = recorded if recorded in PRIOR_TYPES else PRIOR_NONE
+
+    ok(f"CRI 血緣來源：特徵表的 {'／'.join(LINEAGE_COLS)} 欄（不是 spec 的自我宣告）")
+    detail(infos, f"先驗群欄位：{describe_prior_cols(cols)}"
+                  f"｜特徵表記錄 {recorded}｜本次重判 {effective}"
+                  f"｜spec 宣告 {spec_prior if spec_prior is not None else '（未填）'}")
+
+    if cols and effective != recorded:
+        warn(f"血緣重判與特徵表記錄不同：記錄 {recorded}、重判 {effective}",
+             "多半是 demographic_vars.py 的人口變數清單在特徵表產出之後更新過。"
+             "以重判為準（比較嚴），並重跑 build_features.py 讓兩邊一致")
+
+    # 根本沒有先驗分群層：CRI 整欄是 N/A，先講這件事，不要叫人去把 spec 改成 "none"
+    if effective == PRIOR_NONE:
+        err(f"input_vars 含 CRI（{cri_txt}），但**資料說這批特徵沒有先驗分群層**"
+            f"（prior_group_type = none）"
+            + (f"，而 cluster_spec.json 說 {spec_prior}" if spec_txt is not None else ""),
+            "沒有先驗群就沒有 τ²_g，CRI 全部是 N/A，整欄會在缺值那一步被剔光。"
+            "把 CRI 從 input_vars 拿掉，或用 build_features.py 的 --dim 與 "
+            "--prior-group-cols 給一組行為分層先驗群重跑 —— 改 spec 的字串不會生出 CRI")
+        return
+
+    # ── 交叉檢查：資料說什麼 vs spec 說什麼 ──
+    # 07 §3.1 原文是「僅當 cluster_spec.json 的 cri_prior_type == behavioral 時
+    # CRI 才可進分群輸入」，所以 spec 沒填一樣是 error —— 資料的血緣是**加上去的**
+    # 一道關卡，不是拿來免除規格檔那一道。
+    if spec_txt is None:
+        err(f"input_vars 含 CRI（{cri_txt}）但 cluster_spec.json 的 cri_prior_type "
+            f"沒填（缺這個鍵，或值是 null）；**資料說 {effective}**"
+            f"（先驗群欄位 {cols_raw or '（無）'}）",
+            f"07 §3.1 要求規格檔明寫 cri_prior_type，07 §3.3 要求四項決策入檔。"
+            f"照資料把它填成 \"{effective}\"")
+    elif spec_txt != effective:
+        err(f"CRI 血緣不一致：**資料說 {effective}**（先驗群欄位 {cols_raw or '（無）'}"
+            + (f"，命中人口變數清單的是 {data['prior_group_demographic_cols']}"
+               if data["prior_group_demographic_cols"] else "")
+            + f"）、**cluster_spec.json 說 {spec_prior}**",
+            f"以資料為準 —— spec 的 cri_prior_type 是自我宣告，填錯或亂填都不該能放行，"
+            f"這一關就是為了攔它。把 spec 的 cri_prior_type 改成 \"{effective}\"，"
+            f"或用真正的行為分層先驗群重跑 build_features.py 再進來。"
+            f"（判定依據：scripts/demographic_vars.py 的人口變數清單）")
+
+    # ── 判決：只有 behavioral 放行 ──
+    if effective == PRIOR_BEHAVIORAL:
+        if spec_txt == PRIOR_BEHAVIORAL:
+            ok(f"CRI 血緣通過：資料與 spec 都是 behavioral（{cri_txt}）")
+        detail(infos, "07 §8.4 排除條款仍要人工確認：先驗群用到的欄位不得進卡方表")
+        detail(infos, "behavioral 的判定是「先驗欄位沒有命中人口變數清單」，"
+                      "不等於已證明是行為量 —— 清單見 scripts/demographic_vars.py")
+        return
+
+    err(f"CRI 的先驗群是{'人口變數' if effective == 'demographic' else '人口變數與其他欄位混用'}"
+        f"（{data['prior_group_demographic_cols'] or cols_raw}），不得進分群矩陣",
+        "07 §3.1：先驗群用人口變數時，交易紀錄完全相同的兩人也會因人口欄不同"
+        "拿到不同 CRI（同一個 s²/n 下 CRI 差到 21.4 vs 79.1），等於把人口變數"
+        "以非線性編碼送進矩陣。做法二選一：(a) 把 CRI 從 input_vars 拿掉；"
+        "(b) 先驗群改用行為分層（如 F 三分位、品類廣度）重跑 build_features.py —— "
+        "特徵表的 prior_group_type 變成 behavioral 才會放行，改 spec 的字串沒有用。"
+        "另外，07 §8.4 排除條款：那批先驗人口變數也不得進卡方表")
 
 
 # ── 資料讀取 ─────────────────────────────────────────────
@@ -411,7 +518,7 @@ def fit_labels(X: np.ndarray, k: int, seed: int, n_init: int) -> np.ndarray:
 
 # ── 主流程 ───────────────────────────────────────────────
 def main() -> int:
-    ap = argparse.ArgumentParser(
+    ap = GateArgumentParser(
         description="M6 分群矩陣前處理（白名單／CRI 血緣／偏度／標準化／WGSS 貢獻）")
     ap.add_argument("project", help="專案代號")
     ap.add_argument("--input", type=Path, help="顧客特徵表 .parquet / .csv")
@@ -448,8 +555,8 @@ def main() -> int:
 
     # (1) 白名單
     classified = check_whitelist(input_vars)
-    # (2) CRI 血緣
-    check_cri_lineage(classified, spec)
+    # (2) CRI 血緣 —— 以資料裡的血緣欄位為準，spec 只做交叉檢查
+    check_cri_lineage(classified, spec, df)
     if errors:
         return report(args.verbose)
 
@@ -757,13 +864,21 @@ def report(verbose: bool = False) -> int:
     print("\n" + "=" * 68)
     if errors:
         print(f"結果：{n_err} 個 error、{n_warn} 個 warning → 矩陣未產出，M6 不准往下走")
-        return 1
+        return EX_ERROR
     if warnings:
         print(f"結果：{n_warn} 個 warning → {made}報告要逐條回應上面的警告")
-        return 2
+        return EX_WARN
     print(f"結果：全部通過 → {made}可以進 kmeans_preflight.py")
-    return 0
+    return EX_OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"⛔ prep_cluster_matrix.py 本身失敗：{type(exc).__name__}: {exc}\n"
+              f"   → 退出碼 {EX_SOFTWARE}（腳本自身異常）。修腳本（00 §八）。",
+              file=sys.stderr)
+        raise SystemExit(EX_SOFTWARE) from exc

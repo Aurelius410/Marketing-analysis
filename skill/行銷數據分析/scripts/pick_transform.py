@@ -16,10 +16,12 @@ M3 轉換方法選用 —— 給一個數值欄，依 `references/06_前處理�
 這支只「建議」不「執行」（06 §一 程式碼區塊的原話）。輸出要進
 `顧客特徵表/transform_log.csv` 之前由人確認，實際寫檔是 write_transform_log.py。
 
-三桶輸出 + 退出碼（沿用 setup_check.py 的形式）：
-    0 = 通過，可以照建議做
-    1 = 有 error，擋住（零膨脹要改模型／天花板效應／反轉換偏誤／比率或時間欄取 log）
-    2 = 只有 warning，可以做但要補動作（灰帶零佔比、arcsinh 敏感度、分支 C 條件）
+三桶輸出 + 退出碼（全庫統一，權威定義見 00 §八）：
+    0  = 通過，可以照建議做
+    1  = 有 error，擋住（零膨脹要改模型／天花板效應／反轉換偏誤／比率或時間欄取 log）
+    2  = 只有 warning，可以做但要補動作（灰帶零佔比、arcsinh 敏感度、分支 C 條件）
+    64 = 用法錯誤（旗標打錯、缺 --col、--check-exp 沒配 --deliverable）
+    70 = 腳本自身異常
 
 用法：
     # 從 parquet 讀一個欄，用途是預測
@@ -60,6 +62,9 @@ import numpy as np
 from scipy import stats
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_USAGE, EX_SOFTWARE, GateArgumentParser,
+)
 from paths import archive_root, project_dir  # noqa: E402
 
 if sys.platform == "win32":
@@ -1072,12 +1077,12 @@ def flush_buckets(verbose: bool = False) -> int:
     print("\n" + "=" * 70)
     if errors:
         print(f"結果：{n_err} 個 error、{n_warn} 個 warning → 擋住，不要照建議動手")
-        return 1
+        return EX_ERROR
     if warnings:
         print(f"結果：{n_warn} 個 warning → 可以做，但上面那幾件要補")
-        return 2
+        return EX_WARN
     print(f"結果：全部通過（{len(infos)} 項）→ 照建議做，理由寫進 transform_log.csv")
-    return 0
+    return EX_OK
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1342,20 +1347,23 @@ def self_test() -> int:
 
     print(f"\n\n{'=' * 70}\n自我測試總表\n{'=' * 70}")
     for title, rc in results:
-        tag = {0: "0 通過", 1: "1 擋住", 2: "2 有警告"}[rc]
+        tag = {EX_OK: "0 通過", EX_ERROR: "1 擋住", EX_WARN: "2 有警告"}[rc]
         print(f"  [{tag}] {title}")
     print(f"\n已知事實斷言：{'全部通過' if allok else '有失敗'}")
-    return 0 if allok else 1
+    return EX_OK if allok else EX_ERROR
 
 
 # ═══════════════════════════════════════════════════════════════════
 def main() -> int:
-    ap = argparse.ArgumentParser(
+    ap = GateArgumentParser(
         description="M3 轉換方法選用（06 §一 七情境順位表 + §二 反轉換防呆 + "
                     "§三 winsorize 順序）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("用法：")[-1])
-    ap.add_argument("專案代號", help="paths.project_dir 用它決定資料庫與輸出位置")
+    # --self-test 不碰真實專案，允許省略專案代號（自我測試旗標全庫統一，00 §八）
+    ap.add_argument("project", metavar="專案代號", nargs="?",
+                    help="paths.project_dir 用它決定資料庫與輸出位置。"
+                         "--self-test 時可省略")
     ap.add_argument("--parquet", help="資料檔（絕對路徑，或相對於專案子目錄）")
     ap.add_argument("--table", help="從專案 DuckDB 讀（走 db.connect，唯讀）")
     ap.add_argument("--col", help="要判定的數值欄名")
@@ -1394,8 +1402,11 @@ def main() -> int:
     if args.self_test:
         return self_test()
 
+    if not args.project:
+        ap.error("要指定專案代號（只有 --self-test 可以省略）")
+
     print("=" * 70)
-    print(f"M3 轉換方法選用｜專案：{args.專案代號}")
+    print(f"M3 轉換方法選用｜專案：{args.project}")
     print("規格：references/06_前處理與轉換.md §一 順位表／§二 反轉換／§三 winsorize")
     print("=" * 70)
 
@@ -1403,24 +1414,24 @@ def main() -> int:
         if not args.deliverable:
             print("⛔ --check-exp 要一起給 --deliverable —— "
                   f"可用：{', '.join(DELIVERABLES)}")
-            return 1
+            return EX_USAGE
         guard_exp_retransform(args.deliverable, args.action)
         return flush_buckets(args.verbose)
 
     if not args.col:
         print("⛔ 沒給 --col —— 這支一次判一個數值欄，欄名是必要的")
-        return 1
+        return EX_USAGE
 
     try:
-        df = load_frame(args.專案代號, args.parquet, args.table)
+        df = load_frame(args.project, args.parquet, args.table)
     except Exception as e:  # noqa: BLE001
         print(f"⛔ 讀資料失敗：{e}")
-        return 1
+        return EX_ERROR
 
     if args.col not in df.columns:
         print(f"⛔ 找不到欄位 `{args.col}` —— 這張表的欄位是："
               f"{', '.join(map(str, df.columns[:40]))}")
-        return 1
+        return EX_ERROR
 
     peer = None
     if args.peer_cols:
@@ -1428,7 +1439,7 @@ def main() -> int:
         miss = [c for c in names if c not in df.columns]
         if miss:
             print(f"⛔ --peer-cols 有欄位不存在：{', '.join(miss)}")
-            return 1
+            return EX_ERROR
         peer = {c: df[c].to_numpy(dtype=float, na_value=np.nan) for c in names}
 
     ids = df[args.id_col].to_numpy() if args.id_col and args.id_col in df.columns \
@@ -1447,7 +1458,7 @@ def main() -> int:
     if args.json:
         out_path = Path(args.json)
     elif args.save:
-        pp = project_dir(args.專案代號)
+        pp = project_dir(args.project)
         out_path = pp.features / f"transform_suggestion__{args.col}.json"
     if out_path:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1465,4 +1476,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"⛔ pick_transform.py 本身失敗：{type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        print(f"   → 退出碼 {EX_SOFTWARE}（腳本自身異常）。修腳本（00 §八）。",
+              file=sys.stderr)
+        raise SystemExit(EX_SOFTWARE) from exc

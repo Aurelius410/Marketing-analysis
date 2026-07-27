@@ -37,10 +37,15 @@
     # 2) 命令列
     python write_transform_log.py <專案代號> --from-json rows.json
     python write_transform_log.py <專案代號> --validate
-    python write_transform_log.py <專案代號> --self-test   # 用素材庫樣本實跑一次
+    python write_transform_log.py --self-test              # 用素材庫樣本實跑一次
+    python write_transform_log.py <專案代號> --self-test   # 同上，指定專案
 
-驗收（--validate）沿用 setup_check.py 的三桶 + 退出碼：
-    0 = 全通過｜1 = 有 error（缺理由、缺欄、Spearman 破線）｜2 = 只有 warning
+驗收（--validate）的三桶 + 退出碼（全庫統一，權威定義見 00 §八）：
+    0  = 全通過
+    1  = 有 error（缺理由、缺欄、Spearman 破線）
+    2  = 只有 warning
+    64 = 用法錯誤（旗標打錯、三選一都沒給、非 --self-test 卻沒給專案代號）
+    70 = 腳本自身異常
 """
 
 from __future__ import annotations
@@ -56,6 +61,9 @@ from pathlib import Path
 from typing import Any, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_USAGE, EX_SOFTWARE, GateArgumentParser,
+)
 from paths import project_dir  # noqa: E402
 
 if sys.platform == "win32":
@@ -384,7 +392,8 @@ def _render_md(project: str, rows: list[dict[str, str]]) -> str:
         "python scripts/write_transform_log.py <專案代號> --validate",
         "```",
         "",
-        "退出碼 0 = 全通過｜1 = 有 error（缺理由、缺欄、Spearman 破線）｜2 = 只有 warning。",
+        "退出碼 0 = 全通過｜1 = 有 error（缺理由、缺欄、Spearman 破線）｜"
+        "2 = 只有 warning｜64 = 用法錯誤｜70 = 腳本自身異常（00 §八）。",
         "",
     ]
     return "\n".join(L)
@@ -402,8 +411,8 @@ class ValidateResult:
         n_err = sum(1 for m in self.errors if not m.startswith("    "))
         n_warn = sum(1 for m in self.warnings if not m.startswith("    "))
         if n_err:
-            return 1
-        return 2 if n_warn else 0
+            return EX_ERROR
+        return EX_WARN if n_warn else EX_OK
 
     def ok(self) -> bool:
         return not self.errors
@@ -643,6 +652,11 @@ def validate_log(project: str, verbose: bool = False) -> ValidateResult:
 
 
 # ── 自我測試：用素材庫樣本實跑一次 ──────────────────────────
+#: --self-test 省略專案代號時用的暫存專案名。真實專案不會叫這個名字，
+#: 所以拿它當「使用者沒給專案代號」的哨兵是安全的。
+SELF_TEST_PROJECT = "__self_test__"
+
+
 def self_test(project: str) -> int:
     """拿課程信用卡樣本（100 位客戶 / 7,764 筆）真的做一次轉換並落檔。
 
@@ -657,11 +671,11 @@ def self_test(project: str) -> int:
     if ar is None:
         print("⛔ 找不到素材庫 00_source_archive — self-test 需要樣本檔。"
               "改用 --from-json 或在 config.yml 指定「素材庫」")
-        return 1
+        return EX_ERROR
     src = ar / "local" / "資料集剖析" / "samples" / "ntu_creditcard__transactions.parquet"
     if not src.exists():
         print(f"⛔ 找不到樣本：{src} — self-test 需要它。改用 --from-json")
-        return 1
+        return EX_ERROR
 
     df = pd.read_parquet(src)
     g = df.groupby("客戶ID")
@@ -781,12 +795,15 @@ def _print_result(project: str, res: ValidateResult, verbose: bool) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(
+    ap = GateArgumentParser(
         description="M3 轉換紀錄（06 §六 六欄格式）的落檔與驗收",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="退出碼：0 全通過｜1 有 error｜2 只有 warning",
+        epilog="退出碼：0 全通過｜1 有 error｜2 只有 warning｜"
+               "64 用法錯誤｜70 腳本自身異常（00 §八）",
     )
-    ap.add_argument("project", help="專案代號")
+    # --self-test 不碰真實專案，允許省略專案代號（與 stats_utils 的自我測試對齊）
+    ap.add_argument("project", nargs="?", default=SELF_TEST_PROJECT,
+                    help=f"專案代號。--self-test 時可省略，預設 {SELF_TEST_PROJECT}")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--from-json", metavar="檔案",
                    help="讀一份 JSON（六欄的 list）寫進紀錄")
@@ -799,6 +816,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     help="不要鏡射到 顧客特徵表/（預設會鏡射，06 §六 的路徑）")
     ap.add_argument("--verbose", action="store_true", help="連通過項也列出")
     args = ap.parse_args(argv)
+
+    if not args.self_test and args.project == SELF_TEST_PROJECT:
+        # 只有 --self-test 能省略專案代號；其餘模式沒給就是用法錯誤（00 §八）
+        ap.error("要指定專案代號（只有 --self-test 可以省略）")
 
     if args.self_test:
         rc = self_test(args.project)
@@ -813,20 +834,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         src = Path(args.from_json)
         if not src.exists():
             print(f"⛔ 找不到 {src} — 確認路徑，或用 row_from_arrays() 在程式裡建列")
-            return 1
+            return EX_ERROR
         try:
             data = json.loads(src.read_text(encoding="utf-8"))
         except json.JSONDecodeError as e:
             print(f"⛔ {src} 不是合法 JSON（{e}）— 用 UTF-8 存檔，"
                   f"外層是 list，每個元素是六欄的 dict")
-            return 1
+            return EX_ERROR
         if isinstance(data, dict):
             data = [data]
         try:
             rows = [row_from_dict(d) for d in data]
         except (ValueError, KeyError, TypeError) as e:
             print(f"⛔ {e}")
-            return 1
+            return EX_ERROR
         written = write_log(args.project, rows,
                             merge=not args.replace, mirror=not args.no_mirror)
         print(f"已寫入 {len(rows)} 列：")
@@ -840,4 +861,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"⛔ write_transform_log.py 本身失敗：{type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        print(f"   → 退出碼 {EX_SOFTWARE}（腳本自身異常）。修腳本（00 §八）。",
+              file=sys.stderr)
+        raise SystemExit(EX_SOFTWARE) from exc

@@ -18,6 +18,14 @@ DuckDB 連線 —— 所有 SQL 都從這裡進出。
 
 自我檢查：
     python db.py <專案代號>
+
+退出碼（全庫統一，權威定義見 references/00_通則與紀律.md §八）：
+    0  = 全通過（連線成功）
+    1  = 有 error 擋住（連線失敗）
+    2  = 只有 warning，可往下（資料庫檔位置有風險但連得上）
+    64 = 用法錯誤（沒給專案代號、旗標打錯）—— 舊版這裡回 2，會被驅動腳本
+         誤讀成「跑完了只有警告」
+    70 = 腳本自身異常
 """
 
 from __future__ import annotations
@@ -29,6 +37,9 @@ from typing import Any, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paths import cfg, project_dir  # noqa: E402
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_SOFTWARE, GateArgumentParser,
+)
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -126,12 +137,13 @@ def tables(project: str) -> list[str]:
 
 
 def _main() -> int:
-    if len(sys.argv) < 2:
-        print(__doc__)
-        print("用法：python db.py <專案代號>")
-        return 2
+    # 舊版用 len(sys.argv) 手判並回 2 —— 那是「只有 warning，可往下」的碼。
+    # 改走 GateArgumentParser：缺參數／打錯旗標一律 64（00 §八）。
+    ap = GateArgumentParser(description="DuckDB 連線自我檢查")
+    ap.add_argument("project", help="專案代號")
+    args = ap.parse_args()
 
-    project = sys.argv[1]
+    project = args.project
     p = project_dir(project, create=False)
     print("=" * 60)
     print(f"專案：{project}")
@@ -163,11 +175,24 @@ def _main() -> int:
                 print(f"  {t}")
             if len(ts) > 20:
                 print(f"  …另有 {len(ts) - 20} 張")
-        return 0
+        if _check_db_location(p.db):
+            print(f"\n⚠ 資料庫位置有風險（見上），連得上但不建議 "
+                  f"→ 退出碼 {EX_WARN}")
+            return EX_WARN
+        return EX_OK
     except Exception as e:  # noqa: BLE001
+        # 連不上是「資料／環境側」的問題，不是腳本壞了 → 1 不是 70
         print(f"⛔ 連線失敗：{e}")
-        return 1
+        return EX_ERROR
 
 
 if __name__ == "__main__":
-    raise SystemExit(_main())
+    try:
+        raise SystemExit(_main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"⛔ db.py 本身失敗：{type(exc).__name__}: {exc}\n"
+              f"   → 退出碼 {EX_SOFTWARE}（腳本自身異常）。修腳本（00 §八）。",
+              file=sys.stderr)
+        raise SystemExit(EX_SOFTWARE) from exc

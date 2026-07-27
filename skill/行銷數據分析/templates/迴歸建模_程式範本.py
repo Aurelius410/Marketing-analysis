@@ -6,16 +6,68 @@
 環境：Python 3.14.1 主環境。statsmodels 0.14.6 / scipy 1.16.3 / numpy 2.3.5 / pandas 2.3.3
 本檔的 `anova3` / `plot_lm` / `vif_table` / `emmeans` 正本在 scripts/stats_utils.py，
 這裡只 import，**不要在這裡再寫一份**（08 §十 維護條款第 2 條）。
+
+────────────────────────────────────────────────────────────────────────
+複製這份要改哪幾個地方（其餘照抄即可）：
+  1. **不用改 import**。下面的 `_locate_scripts()` 會自己往上找 `scripts/stats_utils.py`，
+     所以本檔留在 templates/、複製到 `projects/<代號>/` 底下、或複製到 skill 根目錄旁
+     都跑得起來。搬到 skill 樹之外時，設環境變數 `MKT_SKILL_ROOT`（或 `MKT_SKILL根目錄`）
+     指到 skill 資料夾。
+  2. `y_profile(df['你的應變數'])` —— 換成你自己的 y 欄名，先看它該走哪個模型族。
+  3. 各函式的 `formula` 字串 —— `"y ~ x1 + x2"` 全部換成你的欄名。
+  4. `segment_slope_test(..., ref=...)` 的 `ref` —— 換成人數最多或現行主打的那一群，
+     不是字母序第一個（基準組選錯會讓所有群看起來都沒差異）。
+  5. `sensitivity(..., drop_idx=...)` 的 `drop_idx` —— 換成 `influence_flags()` 標出來的
+     那幾列索引，不是憑印象挑的點。
+本檔沒有 `__main__`：直接 `python 迴歸建模_程式範本.py` 只會驗證 import 通不通，
+不會跑任何模型。要用就 `from 迴歸建模_程式範本 import y_profile, influence_flags, ...`。
+────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 
-from scripts.stats_utils import anova3, emm_contrasts, emmeans, plot_lm, vif_table  # noqa: F401
+
+def _locate_scripts() -> Path:
+    """找出 scripts/ 的位置並塞進 sys.path。
+
+    為什麼要這一段：本檔是**範本**，會被複製到專案任何一層，而 `scripts/` 沒有
+    `__init__.py`。原本寫 `from scripts.stats_utils import ...` 只有在「工作目錄剛好
+    是 skill 根目錄」時才成立 —— 直接 `python templates/迴歸建模_程式範本.py` 會
+    `ModuleNotFoundError`。改成從本檔位置往上找，並與其他腳本統一成
+    `from stats_utils import ...`（08 §二 要求統一 import 慣例）。
+    """
+    # 環境變數前綴沿用 paths.py 的 ENV_PREFIX = "MKT_"。paths.py 目前沒有 skill 根目錄
+    # 這個設定鍵（SKILL_ROOT 是由 __file__ 推出來的），所以這個變數只在本範本生效；
+    # 中英文兩種寫法都收，省得記。
+    cands = [Path(v) / "scripts" for k in ("MKT_SKILL_ROOT", "MKT_SKILL根目錄")
+             if (v := os.environ.get(k))]
+    here = Path(__file__).resolve()
+    cands += [base / "scripts" for base in (here.parent, *here.parents)]
+    for c in cands:
+        if (c / "stats_utils.py").is_file():
+            if str(c) not in sys.path:
+                sys.path.insert(0, str(c))
+            return c
+    raise SystemExit(
+        "⛔ 找不到 scripts/stats_utils.py —— 本檔只 import 它，不自己重寫一份"
+        "（08 §十 維護條款第 2 條）。\n"
+        f"   已找過：{', '.join(str(c) for c in cands[:6])}\n"
+        "   解法：把本檔放回 skill 樹底下（templates/ 或 projects/<代號>/ 都行），"
+        "或設環境變數 MKT_SKILL_ROOT 指到 skill 資料夾。")
+
+
+_locate_scripts()
+
+from stats_utils import anova3, emm_contrasts, emmeans, plot_lm, vif_table  # noqa: E402,F401
 
 
 # ---------------------------------------------------------------------------

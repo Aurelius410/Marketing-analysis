@@ -36,7 +36,9 @@ p.raw, p.staging, p.mart, p.features, p.figures, p.memory
 python scripts/setup_check.py
 ```
 
-退出碼 0 = 全通過、1 = 有 error 不能開工、2 = 可開工但部分模組不可用。它會告訴你缺什麼套件、缺哪幾份 reference、字型在不在。
+退出碼 0 = 全通過、1 = 有 error 不能開工、2 = 可開工但部分模組不可用、**64 = 你的命令列打錯**（旗標拼錯、缺必填參數，腳本根本沒跑）、70 = 腳本自身異常。它會告訴你缺什麼套件、缺哪幾份 reference、字型在不在。
+
+**這五個碼全 `scripts/` 通用**，權威定義在 `references/00_通則與紀律.md` §八，實作在 `scripts/exitcodes.py`。寫 wrapper 時不要用 `if [ $? -le 2 ]` —— 64 才是「沒跑起來」，2 是「跑完了只有警告」。
 
 ## 環境（有陷阱）
 

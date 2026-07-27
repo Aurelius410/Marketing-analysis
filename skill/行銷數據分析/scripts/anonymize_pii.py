@@ -12,9 +12,15 @@
     python anonymize_pii.py --dry-run          # 只看會改什麼，不動檔案
     python anonymize_pii.py                    # 實際執行
     python anonymize_pii.py --root <路徑>      # 指定掃描根目錄
+
+退出碼（全庫統一，權威定義見 references/00_通則與紀律.md §八）：
+    0  = 全通過
+    1  = 有 error（掃描根目錄不存在）
+    2  = 只有 warning（有檔案讀不進來被跳過），替換仍已完成
+    64 = 用法錯誤（旗標打錯、缺必填參數）—— 腳本根本沒跑
+    70 = 腳本自身異常
 """
 
-import argparse
 import json
 import re
 import sys
@@ -31,6 +37,10 @@ try:
     DEFAULT_ROOT = SKILL_ROOT.parent.parent      # skill/<名稱>/ → skill/ → repo root
 except ImportError:                              # 單獨複製這支腳本時的退路
     DEFAULT_ROOT = Path.cwd()
+
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_SOFTWARE, GateArgumentParser,
+)
 
 # --- 要匿名化的第三方 ---------------------------------------------------
 # 依在素材庫出現的次數排序，代號一經指定就不要再改（否則舊文件對不上）
@@ -112,15 +122,17 @@ def anonymize_text(text: str, name_map: dict[str, str],
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="第三方個資匿名化")
+    ap = GateArgumentParser(description="第三方個資匿名化")
     ap.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="掃描根目錄")
     ap.add_argument("--dry-run", action="store_true", help="只報告，不改檔")
     args = ap.parse_args()
 
     root: Path = args.root
     if not root.exists():
-        print(f"✗ 找不到根目錄：{root}")
-        return 2
+        # 路徑不存在是 error（擋住），不是 warning。舊版回 2 會被驅動腳本
+        # 讀成「跑完了只有警告」而繼續往下（00 §八）
+        print(f"⛔ 找不到根目錄：{root}")
+        return EX_ERROR
 
     name_map = build_name_map()
     id_map: dict[str, str] = {}
@@ -135,11 +147,13 @@ def main() -> int:
     print("=" * 60)
 
     changed, total_hits = [], 0
+    skipped = 0
     for p in files:
         try:
             original = p.read_text(encoding="utf-8")
         except (UnicodeDecodeError, PermissionError) as e:
             print(f"⚠ 跳過（讀取失敗）：{p.name} — {e}")
+            skipped += 1
             continue
 
         new_text, hits = anonymize_text(original, name_map, id_map, id_counter)
@@ -178,8 +192,19 @@ def main() -> int:
     if args.dry_run:
         print("\n（dry-run：未實際修改任何檔案）")
 
-    return 0
+    if skipped:
+        print(f"\n⚠ 有 {skipped} 個檔案讀不進來被跳過 → 退出碼 {EX_WARN}")
+        return EX_WARN
+    return EX_OK
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"⛔ anonymize_pii.py 本身失敗：{type(exc).__name__}: {exc}\n"
+              f"   → 退出碼 {EX_SOFTWARE}（腳本自身異常）。修腳本（00 §八）。",
+              file=sys.stderr)
+        raise SystemExit(EX_SOFTWARE) from exc

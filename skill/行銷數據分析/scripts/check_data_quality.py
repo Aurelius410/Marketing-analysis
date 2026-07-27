@@ -10,11 +10,21 @@ M1 資料品質三桶 —— M1 → M2 的**唯一放行機制**（04 §一 步�
   所以品質檢查不能是「提醒」，必須是**帶退出碼的閘門**：error 桶非空就擋住，
   只能靠在 `原始資料/contracts/<source>.yml` 明確宣告處理方式解除（02 §十）。
 
-三桶與退出碼（04 §四，全 skill 統一，**不准把 1 和 2 對調**）：
-    0 = 三桶皆空或只有 info      → 可進 M2
-    1 = 有 error                 → 擋住，不准進 M2
-    2 = 有 warning 無 error      → 可進 M2，但 warning 必須寫進報告的「資料限制」節
-    3 = 檢查腳本本身失敗          → 修腳本，不准手動略過
+**這支的產出是機器讀的，不只是給人看的**：
+  `統計表/資料體檢/M1_品質檢查三桶.json` 由 `build_features.py` 開頭直接讀 ——
+  error 桶非空就擋住 M2，不靠人記得看退出碼（04 §一 步驟⑤）。所以：
+    · 不准手動編輯或刪除那份 JSON，要改判定就改契約的 `quality_overrides:` 後重跑。
+    · 帶 `--no-write` 跑等於沒有放行紀錄，`build_features.py` 會擋住。
+    · 逃生門是 `build_features.py --ignore-quality-gate`，它會印醒目警告並留痕。
+
+三桶與退出碼（權威定義見 00 §八；M1 這一關的下游行為見 04 §四。
+**不准把 1 和 2 對調**）：
+    0  = 三桶皆空或只有 info      → 可進 M2
+    1  = 有 error                 → 擋住，不准進 M2
+    2  = 有 warning 無 error      → 可進 M2，但 warning 必須寫進報告的「資料限制」節
+    64 = 用法錯誤（旗標打錯、缺專案代號、沒給 --table/--file、檢查代號不認識）
+         → 擋住。閘門根本沒跑。舊版這幾種情況回 3，跟「腳本壞了」混在一起
+    70 = 檢查腳本本身失敗         → 修腳本，不准手動略過（舊版是 3）
 
 用法：
     # 檢查專案倉儲裡既有的表
@@ -66,6 +76,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from exitcodes import (  # noqa: E402
+    EX_OK, EX_ERROR, EX_WARN, EX_USAGE, EX_SOFTWARE, GateArgumentParser,
+)
+from contract import (  # noqa: E402
+    Contract, ContractError, load_contract, qi, qs,
+)
 from db import connect  # noqa: E402
 from paths import project_dir  # noqa: E402
 
@@ -164,34 +180,8 @@ class Finding:
         return f"{self.detail} → {self.action}（{tag}）"
 
 
-@dataclass
-class Contract:
-    """`原始資料/contracts/<source>.yml`，02 §十。缺席時所有欄位為空。"""
-    path: Path | None = None
-    source: str = ""
-    grain: dict[str, list[str]] = field(default_factory=dict)
-    columns: dict[str, dict[str, Any]] = field(default_factory=dict)
-    sentinels: list[dict[str, Any]] = field(default_factory=list)
-    overrides: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-
-    @property
-    def loaded(self) -> bool:
-        return self.path is not None
-
-    def use_of(self, col: str) -> str:
-        return str(self.columns.get(col, {}).get("practical_use", "") or "")
-
-    def unit_of(self, col: str) -> str:
-        return str(self.columns.get(col, {}).get("unit", "") or "")
-
-    def dtype_of(self, col: str) -> str:
-        return str(self.columns.get(col, {}).get("dtype", "") or "")
-
-    def sentinel_declared(self, col: str, value: Any) -> dict[str, Any] | None:
-        for s in self.sentinels:
-            if str(s.get("column")) == col and str(s.get("value")) == str(value):
-                return s
-        return None
+# Contract 的定義搬到 scripts/contract.py（與 check_schema_contract.py 共用）——
+# 兩支腳本讀同一個 contracts/<source>.yml，解析實作只能有一份。
 
 
 @dataclass
@@ -217,16 +207,7 @@ class Ctx:
 
 
 # ── DuckDB 小工具 ────────────────────────────────────────
-def qi(name: str) -> str:
-    """識別字引號化。中文欄名、含空白的欄名（`Unnamed: 10`）都必須走這裡。"""
-    return '"' + str(name).replace('"', '""') + '"'
-
-
-def qs(value: Any) -> str:
-    """字串常值引號化。"""
-    return "'" + str(value).replace("'", "''") + "'"
-
-
+# qi() / qs() 由 scripts/contract.py 提供（原本兩支腳本各寫一份同語意的實作）。
 def fetch(ctx: Ctx, sql: str) -> list[tuple]:
     return ctx.con.execute(sql).fetchall()
 
@@ -516,13 +497,28 @@ def q6_grain(ctx: Ctx) -> list[Finding]:
     """
     out: list[Finding] = []
     g = grains(ctx)
+    declared = [k for k in ctx.contract.grain if k != "*"]
     for t in ctx.tables:
         gcols = g.get(t)
         if not gcols:
-            out.append(mk("Q6", t, 0, 0,
-                          "未宣告 grain，無法驗證主鍵唯一性",
-                          f"在契約寫 grain: {{{t}: [欄名…]}}，或用 --grain {t}=欄1,欄2",
-                          bucket="warning"))
+            # 別名對不上契約表名時要明講。`--file 交易=…` 與 `--file transactions=…`
+            # 指向同一個檔，前者出這條 warning、後者靜默通過 —— 差別只在別名，
+            # 而原本的訊息完全沒提到「契約其實宣告了 grain，只是表名對不上」，
+            # 使用者會以為是契約漏寫而跑去補一份重複宣告。
+            detail = "未宣告 grain，無法驗證主鍵唯一性"
+            action = f"在契約寫 grain: {{{t}: [欄名…]}}，或用 --grain {t}=欄1,欄2"
+            if declared:
+                shown = "、".join(f"{k}: [{'、'.join(g[k]) if g.get(k) else ''}]"
+                                 for k in declared)
+                detail = (f"未宣告 grain。契約 {ctx.contract.path.name} 宣告了 "
+                          f"grain: {{{shown}}}，但你給的別名是「{t}」，對不上")
+                action = (f"三選一：① 把別名改成契約的表名，"
+                          f"例如 --file {declared[0]}=<路徑>；"
+                          f"② 用 --grain {t}=欄1,欄2 就地指定；"
+                          f"③ 這張表真的不在契約裡，就在契約補 grain: {{{t}: [欄名…]}}。"
+                          f"別名與契約表名是硬耦合的，對不上時整份契約（grain／unit／"
+                          f"sentinels 的 table 鍵）都只能退回不分表的模糊比對")
+            out.append(mk("Q6", t, 0, 0, detail, action, bucket="warning"))
             continue
         missing = [c for c in gcols if ctx.col(t, c) is None]
         if missing:
@@ -980,15 +976,40 @@ def q15_thin_entity(ctx: Ctx) -> list[Finding]:
       "M 值的幣別、跨帳戶／跨市場彙總",
       "04 §4.2 Q16")
 def q16_no_currency(ctx: Ctx) -> list[Finding]:
+    """金額欄沒有 currency 欄伴隨 → 單位靠推定。
+
+    但本條的修法字串自己寫著「在契約的 columns[].unit 明寫幣別」，所以**必須真的去讀
+    契約**，否則照著修也解不掉警告，使用者只會學到「這條紅字改不掉，忽略它」——
+    一條永遠亮著的燈等於沒有燈。已宣告 ISO-4217 幣別的欄視為已解決，降為 info
+    留痕（單位確實不是從資料本身讀來的，這件事還是要出現在報告裡）。
+    """
     out: list[Finding] = []
     for t, cols in ctx.tables.items():
         has_amt = [c for c in cols if c.is_num and PAT_AMOUNT.search(c.name)]
         has_cur = any(PAT_CURRENCY.search(c.name) for c in cols)
-        if has_amt and not has_cur:
-            names = "、".join(c.name for c in has_amt)
-            out.append(mk("Q16", f"{t}({names})", len(has_amt), 0,
-                          "有金額欄但沒有幣別欄，單位靠推定",
-                          "在契約的 columns[].unit 明寫幣別（例：TWD），"
+        if not has_amt or has_cur:
+            continue
+        # 契約宣告的幣別（逐表查，查不到才退回不分表的聯集清單）
+        declared = {c.name: ctx.contract.currency_of(c.name, table=t) for c in has_amt}
+        undecl = [c for c in has_amt if not declared[c.name]]
+        decl = [c for c in has_amt if declared[c.name]]
+        if decl:
+            pairs = "、".join(f"{c.name}={declared[c.name]}" for c in decl)
+            out.append(mk("Q16", f"{t}({'、'.join(c.name for c in decl)})", len(decl), 0,
+                          f"無 currency 欄，但契約已宣告幣別：{pairs}"
+                          f"（{ctx.contract.path.name if ctx.contract.path else '契約'}）",
+                          "已解除。報告仍要註明幣別來自契約宣告而非資料欄位，"
+                          "跨帳戶／跨市場彙總前確認宣告是對的",
+                          bucket="info", count_label="個金額欄"))
+        if undecl:
+            names = "、".join(c.name for c in undecl)
+            no_contract = not ctx.contract.loaded
+            out.append(mk("Q16", f"{t}({names})", len(undecl), 0,
+                          "有金額欄但沒有幣別欄，單位靠推定"
+                          + ("（未提供 --contract）" if no_contract else
+                             f"（契約 {ctx.contract.path.name} 沒有替這幾欄宣告 unit）"),
+                          "在契約的 columns[].unit 明寫幣別（例：unit: TWD），"
+                          f"逐表宣告時 table 要等於這裡的表名「{t}」；"
                           "報告要寫 WARNING: currency column absent, unit inferred",
                           count_label="個金額欄"))
     return out
@@ -1092,37 +1113,9 @@ def infer_edges(ctx: Ctx) -> list[tuple[str, str, str, str]]:
 
 
 # ── 契約與 profile 載入 ──────────────────────────────────
-def load_contract(path: Path | None) -> Contract:
-    if path is None:
-        return Contract()
-    if not path.exists():
-        raise FileNotFoundError(
-            f"找不到契約檔：{path}\n"
-            f"  契約住在 <專案>/原始資料/contracts/<source>.yml（03 §1.2）。"
-            f"首次進場沒有契約時先跑 profile_dataset.py 生草稿，或先不要帶 --contract。")
-    try:
-        import yaml
-    except ImportError as e:
-        raise RuntimeError(
-            "要讀契約檔但沒有 PyYAML。跑 pip install pyyaml，"
-            "或先不要帶 --contract（判定力會下降）") from e
-
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    grain = raw.get("grain") or {}
-    if isinstance(grain, list):                       # 單表契約的簡寫
-        grain = {"*": [str(x) for x in grain]}
-    grain = {str(k): [str(x) for x in (v or [])] for k, v in grain.items()}
-    cols = {}
-    for item in raw.get("columns") or []:
-        if isinstance(item, dict) and item.get("name"):
-            cols[str(item["name"])] = item
-    ov: dict[str, list[dict[str, Any]]] = {}
-    for item in raw.get("quality_overrides") or []:
-        if isinstance(item, dict) and item.get("rule"):
-            ov.setdefault(str(item["rule"]).upper(), []).append(item)
-    return Contract(path=path, source=str(raw.get("source", "")), grain=grain,
-                    columns=cols, sentinels=list(raw.get("sentinels") or []),
-                    overrides=ov)
+# load_contract() 由 scripts/contract.py 提供（import 在檔頭）。原本這裡有一份
+# 31 行的複本，與 check_schema_contract.py 那份讀同一個檔卻各自解析 —— 契約
+# schema 一改就兩邊分岔，而且兩邊都不會報錯，只會靜默降級成「沒有契約」。
 
 
 def load_profile(path: Path | None) -> dict[tuple[str, str], dict[str, str]]:
@@ -1200,7 +1193,7 @@ def print_bucket(title: str, icon: str, findings: list[Finding], verbose: bool) 
             print(f"     · 出處：{RULES[f.rule].source}")
 
 
-def write_report(pp: Any, findings: list[Finding], meta: dict[str, Any]) -> list[Path]:
+def write_quality_report(pp: Any, findings: list[Finding], meta: dict[str, Any]) -> list[Path]:
     """三桶結果的落點是 `統計表/資料體檢/`（03 §1.2）。CSV 最後一欄是中文結論（18-E15）。"""
     out_dir = pp.tables / "資料體檢"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1239,9 +1232,9 @@ def list_rules() -> None:
 
 
 # ── 主流程 ───────────────────────────────────────────────
-def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        description="M1 資料品質三桶（error/warning/info + exit code 0/1/2/3）",
+def build_parser() -> GateArgumentParser:
+    ap = GateArgumentParser(
+        description="M1 資料品質三桶（error/warning/info + exit code 0/1/2/64/70）",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("project", nargs="?", help="專案代號（路徑由 paths.py 解析）")
     ap.add_argument("--table", action="append", default=[], help="檢查倉儲裡既有的表，可重複")
@@ -1273,28 +1266,36 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def run(args: argparse.Namespace) -> int:
+def run_quality_check(args: argparse.Namespace) -> int:
     if args.list:
         list_rules()
-        return 0
+        return EX_OK
+    # 以下三種都是「命令列打錯」而不是「腳本壞了」→ 64（舊版回 3，00 §八）
     if not args.project:
         print("⛔ 缺少專案代號 — 用法：python check_data_quality.py <專案代號> "
               "--table <表> 或 --file [別名=]<路徑>；只想看檢查清單就下 --list")
-        return 3
+        return EX_USAGE
     if not args.table and not args.file:
         print("⛔ 沒有指定要檢查什麼 — 至少給一個 --table 或 --file。"
               "M1 的閘門不能對空集合放行。")
-        return 3
+        return EX_USAGE
 
     only = {x.strip().upper() for x in args.only.split(",") if x.strip()}
     skip = {x.strip().upper() for x in args.skip.split(",") if x.strip()}
     unknown = (only | skip) - set(RULES)
     if unknown:
         print(f"⛔ 不認識的檢查代號：{'、'.join(sorted(unknown))} — 下 --list 看合法代號")
-        return 3
+        return EX_USAGE
 
     contract = load_contract(args.contract)
-    as_of = datetime.strptime(args.as_of, "%Y-%m-%d").date() if args.as_of else None
+    # --as-of 打錯格式是「命令列打錯」，不是「腳本壞了」。不接住的話會一路
+    # 掉到底下的 blanket except，被判成 70（= 修腳本），使用者就去查腳本原始碼了。
+    try:
+        as_of = datetime.strptime(args.as_of, "%Y-%m-%d").date() if args.as_of else None
+    except ValueError:
+        print(f"⛔ --as-of 格式錯誤：{args.as_of!r} —— 要 YYYY-MM-DD（例 2012-12-01）",
+              file=sys.stderr)
+        return EX_USAGE
 
     pp = project_dir(args.project, create=True)
     auto_profile = False
@@ -1393,7 +1394,7 @@ def run(args: argparse.Namespace) -> int:
                 "tables": {t: rows[t] for t in tables},
                 "contract": str(contract.path or ""), "rules_run": ran,
                 "generated_at": datetime.now().isoformat(timespec="seconds")}
-        for p in write_report(pp, findings, meta):
+        for p in write_quality_report(pp, findings, meta):
             print(f"\n· 已寫出：{p}")
         if args._null_rate_now and "Q7" in ran:
             args._baseline_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1409,24 +1410,41 @@ def run(args: argparse.Namespace) -> int:
         print("結果：⛔ 擋住，不准進 M2。")
         print("      解除途徑只有一條：在契約的 quality_overrides: 逐條宣告處理方式"
               "（rule / decision / reason / decided_by / decided_on）後重跑（02 §十）。")
-        return 1
+        return EX_ERROR
     if warns:
         print("結果：⚠ 可進 M2，但上列 warning 必須逐條寫進報告的「資料限制」節。")
-        return 2
+        return EX_WARN
     print("結果：✅ 三桶無 error 無 warning → 可進 M2。")
     print("      提醒：課程級的乾淨資料集上 Q1/Q6/Q7/Q8/Q10/Q11/Q12 永遠不會變紅，"
           "全綠不等於檢查器有效（04 §九）。")
-    return 0
+    return EX_OK
 
 
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        return run(args)
+        return run_quality_check(args)
+    except ContractError as e:
+        # 契約寫壞／指錯路徑是「資料側」的問題，不是腳本壞了 → 退出碼 1 而不是 70。
+        # 與 check_schema_contract.py 同一套（兩支讀同一個契約檔，不該一支說「修腳本」
+        # 一支說「修契約」）。
+        print(f"\n⛔ {e}", file=sys.stderr)
+        print(f"   退出碼 {EX_ERROR} —— 修契約或 --contract 的路徑後重跑（02 §十）。",
+              file=sys.stderr)
+        return EX_ERROR
+    except FileNotFoundError as e:
+        # 指到不存在的資料檔是「資料側」問題（路徑打錯、檔案還沒產出），
+        # 與 ContractError 同級 → 1。掉進下面的 blanket except 會變成 70，
+        # 叫使用者去修腳本，但腳本沒壞。
+        print(f"\n⛔ {e}", file=sys.stderr)
+        print(f"   退出碼 {EX_ERROR} —— 確認 --file / --profile 的路徑後重跑。",
+              file=sys.stderr)
+        return EX_ERROR
     except Exception as e:  # noqa: BLE001
-        print(f"\n⛔ 檢查腳本本身失敗：{e}", file=sys.stderr)
-        print("   退出碼 3 —— 修腳本或修參數，不准手動略過這一關（04 §四）。", file=sys.stderr)
-        return 3
+        print(f"\n⛔ 檢查腳本本身失敗：{type(e).__name__}: {e}", file=sys.stderr)
+        print(f"   退出碼 {EX_SOFTWARE} —— 修腳本，不准手動略過這一關"
+              f"（00 §八、04 §四）。", file=sys.stderr)
+        return EX_SOFTWARE
 
 
 if __name__ == "__main__":
