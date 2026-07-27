@@ -159,7 +159,7 @@ def robust_refit(formula: str, data: pd.DataFrame, kind: str, groups=None):
 
     保住：係數解讀、效果量、單位效果。
     放棄：找到正確的函數形式；預測區間仍不可信。
-    降級要記進 _log/degradation_log.md（00 §1.6），並在該章小結複述前四欄。
+    降級要記進 執行紀錄/degradation_log.md（00 §1.6），並在該章小結複述前四欄。
     """
     m = smf.ols(formula, data, missing="drop")
     if kind == "hc3":

@@ -1,5 +1,5 @@
 {
-  "_說明": "M6 分群的規格檔，存到 projects/<代號>/05_models/cluster_spec.json。三件事：(1) 讓換一批資料重跑時用同一組決策；(2) 提供 verify_outputs.py 的 S1 gate 資料來源（input_vars）；(3) transform/scaler/distance 任一為 none 時，報告必須寫理由。規格見 references/07_標籤與分群.md §3.3。",
+  "_說明": "M6 分群的規格檔，存到 projects/<代號>/模型輸出/cluster_spec.json。三件事：(1) 讓換一批資料重跑時用同一組決策；(2) 提供 verify_outputs.py 的 S1 gate 資料來源（input_vars）；(3) transform/scaler/distance 任一為 none 時，報告必須寫理由。規格見 references/07_標籤與分群.md §3.3。",
 
   "input_vars": ["r_days_since_last_sale", "ln_f", "ln_m", "cai", "cri"],
   "_input_vars_白名單": "只准 R / F / M / RFM Score / CAI / CRI / 因素分數 / LN_F / LN_M（18-E2）。人口統計變數一律禁止，它們只出現在卡方那一章。",
@@ -14,7 +14,7 @@
   "_transform_規則": "skew > 1 才轉換（M4 三門檻）。CAI 可正可負，不可 log。轉換後複檢排序相關 > 0.95。順位表見 06_前處理與轉換.md §1.2。",
 
   "scaler": "zscore",
-  "scaler_path": "05_models/scaler.json",
+  "scaler_path": "模型輸出/scaler.json",
   "_scaler_規則": "非監督在整個分析集上 fit（沒有 train/test 概念）。有離群且已走完 06 §三 → robust。none 要寫理由。",
 
   "distance": "euclidean",
