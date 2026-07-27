@@ -833,3 +833,92 @@ def test_kmeans_preflight_post_fit_writes_json(root, r_prep):
     assert d["gates_run"] == 5 and d["後兩道已驗"] is True, d
     assert all(isinstance(x["群"], int) for x in d["gate4_detail"]), d["gate4_detail"]
     assert "本節的 K-Means 有兩道前提只能事後檢查" in r.all, "沒印誠實說明模板"
+
+
+# ══════════════════════════════════════════════════════════════
+#  ⑩ S1 循環推論 gate（07 §8.2）—— verify_outputs 的 T08 / T09
+# ══════════════════════════════════════════════════════════════
+def _objects(proj_root: Path) -> tuple[Path, dict]:
+    op = proj_root / "模型輸出" / "analysis_objects.json"
+    return op, json.loads(op.read_text(encoding="utf-8"))
+
+
+def test_s1_gate_blocks_anova_on_cluster_input(root, clean_delivery):
+    """對分群輸入變數跑 ANOVA 必須擋下來。
+
+    07 §8.2 稱這是「整個 M6 最嚴重、也最沒有被任何既有規則攔住的問題」：
+    F 正是 K-Means 被最佳化的量，純隨機噪音一樣得到 p<0.001。素材原文的代價是
+    據此把 29 人定為 VIP，投入 14.5 萬元預算。
+    """
+    op, obj = _objects(clean_delivery)
+    orig = op.read_text(encoding="utf-8")
+    try:
+        obj["anova"].append({"id": "anova_M_by_群", "posthoc_id": "posthoc_M_by_群"})
+        obj["posthoc"].append({"id": "posthoc_M_by_群", "method": "Tukey HSD"})
+        op.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        r = run("verify_outputs.py", PROJ_CLEAN, root=root)
+        assert r.rc == 1, f"S1 違規沒被擋下來\n{r}"
+        assert "T08" in r.all and "循環推論" in r.all, r
+    finally:
+        op.write_text(orig, encoding="utf-8")
+
+
+def test_s1_gate_blocks_eta2_on_cluster_input(root, clean_delivery):
+    """η² 一併禁：它與 F 是嚴格單調的一對一變換，報 η² 等同報 F。"""
+    op, obj = _objects(clean_delivery)
+    orig = op.read_text(encoding="utf-8")
+    try:
+        obj["報了η²的變數"] = ["CAI"]
+        op.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        r = run("verify_outputs.py", PROJ_CLEAN, root=root)
+        assert r.rc == 1, f"報 η² 沒被擋下來\n{r}"
+        assert "嚴格單調" in r.all, r
+    finally:
+        op.write_text(orig, encoding="utf-8")
+
+
+def test_s1_gate_blocks_chi2_on_upstream_var(root, clean_delivery):
+    """血緣：拿分群輸入的上游人口變數跑卡方 = 用被污染的分群檢定污染源。"""
+    op, obj = _objects(clean_delivery)
+    orig = op.read_text(encoding="utf-8")
+    try:
+        obj["分群輸入上游變數"] = ["性別"]
+        obj["卡方檢定變數"] = ["性別", "地區"]
+        op.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        r = run("verify_outputs.py", PROJ_CLEAN, root=root)
+        assert r.rc == 1, f"血緣違規沒被擋下來\n{r}"
+        assert "T09" in r.all and "污染源" in r.all, r
+    finally:
+        op.write_text(orig, encoding="utf-8")
+
+
+def test_s1_gate_catches_undeclared_violation_in_delivered_table(root, clean_delivery):
+    """沒登錄在 analysis_objects.json 的違規也要擋。
+
+    只驗自我宣告的欄位，等於只擋「有誠實登錄的人」—— 沒登錄的照樣交出去。
+    這一條直接掃真的要交出去的統計表。
+    """
+    t = clean_delivery / "統計表" / "行銷分析" / "S1違規_群間比較.csv"
+    t.parent.mkdir(parents=True, exist_ok=True)
+    t.write_text("變數,群1,群2,F值,p值,結論\n"
+                 "M,1200,3400,182.4,<0.001,四群在購買金額上存在極顯著差異\n",
+                 encoding="utf-8-sig")
+    try:
+        r = run("verify_outputs.py", PROJ_CLEAN, root=root)
+        assert r.rc == 1, f"未登錄的 S1 違規沒被擋下來\n{r}"
+        assert "推論欄位" in r.all, r
+    finally:
+        t.unlink()
+
+
+def test_s1_gate_says_so_when_it_cannot_verify(root, clean_delivery):
+    """沒有分群輸入變數時，必須明說「這次沒有驗到」，不准靜默放行。"""
+    op, obj = _objects(clean_delivery)
+    orig = op.read_text(encoding="utf-8")
+    try:
+        obj.pop("分群輸入變數", None)
+        op.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        r = run("verify_outputs.py", PROJ_CLEAN, root=root)
+        assert "S1 gate 這次沒有驗到" in r.all, f"假關卡：沒資料卻靜默通過\n{r}"
+    finally:
+        op.write_text(orig, encoding="utf-8")

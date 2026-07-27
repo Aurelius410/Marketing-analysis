@@ -611,6 +611,177 @@ def chk_T02_cluster_inputs(c: Ctx) -> None:
                       "模型輸出/analysis_objects.json")
 
 
+# ── S1：分群輸入變數的循環推論（07 §8.2）────────────────────
+#
+# K-Means 最小化 WGSS ≡ 最大化 BGSS/WGSS，而單因子 ANOVA 的
+#     F = (BGSS/(k-1)) / (WGSS/(n-k))
+# 正是那個被最佳化的量。對分群輸入變數跑 ANOVA，等於用最佳化後的目標函數值
+# 檢定它自己 —— 把同一份資料換成純隨機常態噪音，一樣得到 p < 0.001。
+# 素材原文的代價：據此把 29 人定為 VIP，投入 29 × 5,000 = 14.5 萬元預算。
+#
+# η² 一併禁：η² = BGSS/TSS 與 F 是嚴格單調的一對一變換
+#     F = η²/(1−η²) · (n−k)/(k−1)，d/dη²[η²/(1−η²)] = 1/(1−η²)² > 0
+# 而 n 與 k 在群大小表裡本來就有，所以報 η² 等同報 F。
+# 實測：100×3 純標準常態噪音跑 z-score → K-Means(k=4)，對第一欄算 η²
+# 三次重跑得 0.503 / 0.454 / 0.493，p ~ 1e-14。
+
+# 「這一格是統計推論」的欄名。95% CI 也在內 —— 群成員是照這個變數的值挑出來的，
+# 那是事後選擇區間，覆蓋率不對，且區間不重疊會被讀成顯著宣稱（07 §8.2）。
+_S1_INFERENCE_COLS = (
+    "p", "p值", "p_value", "pvalue", "sig", "顯著", "顯著性",
+    "η2", "η²", "eta2", "eta_sq", "eta平方", "效果量η²",
+    "f", "f值", "f_stat", "fstat", "f統計量",
+    "95%ci", "95% ci", "ci_low", "ci_high", "信賴區間", "95%信賴區間",
+)
+# 07 §8.2 強制加註的字串（表格標題或表內任一格皆可）
+_S1_PROFILE_NOTE = "僅為輪廓描述"
+
+
+def _s1_norm(v: object) -> str:
+    return str(v).strip().upper().replace(" ", "_").replace("－", "_")
+
+
+def _s1_input_keys(inputs: list) -> set[str]:
+    """分群輸入變數的比對鍵。含 LN_F/LN_M 這種轉換後的別名。"""
+    keys = set()
+    for v in inputs:
+        k = _s1_norm(v)
+        keys.add(k)
+        keys.add(k.removeprefix("LN_"))          # LN_M 與 M 是同一個變數
+        keys.add(k.removesuffix("__LOG1P").removesuffix("__BIN5"))
+    return {k for k in keys if k}
+
+
+def _s1_anova_dv(a: dict) -> str | None:
+    """取 ANOVA 物件的因變數。優先讀明寫的欄位，退而從 id 剖。
+
+    id 慣例是 anova_<因變數>_by_<因子>（見 tests/fixtures 的乾淨交付範例）。
+    剖 id 是退路不是正路 —— 剖不出來時明講驗不了，不要當成通過。
+    """
+    for key in ("因變數", "dv", "y", "應變數", "依變數"):
+        if a.get(key):
+            return str(a[key])
+    aid = str(a.get("id", ""))
+    if aid.lower().startswith("anova_") and "_by_" in aid:
+        return aid[len("anova_"):].split("_by_", 1)[0]
+    return None
+
+
+def chk_T08_s1_no_anova_on_cluster_inputs(c: Ctx) -> None:
+    """S1：分群輸入變數不准跑 ANOVA、不准報 η²／F／95% CI（07 §8.2）"""
+    obj = c.objects("T08")
+    if obj is None:
+        return
+    inputs = obj.get("分群輸入變數")
+    if not inputs:
+        # 沒有 input_vars 這道 gate 就沒有資料來源（07 §177 明講）。
+        # 靜默跳過等於再造一道假關卡 —— 明說它沒驗到。
+        c.rep.add("T08", "warning", "沒有「分群輸入變數」，S1 gate 這次沒有驗到",
+                  "M6 收斂時把實際進矩陣的欄位寫進 analysis_objects.json。"
+                  "沒有它，07 §8.2 這道 critical gate 無法自動檢查",
+                  "模型輸出/analysis_objects.json")
+        return
+    keys = _s1_input_keys(inputs)
+
+    # (a) 自我宣告層：登錄的 ANOVA 因變數 / η² 變數
+    unparsed = []
+    for a in obj.get("anova", []):
+        dv = _s1_anova_dv(a)
+        if dv is None:
+            unparsed.append(str(a.get("id", "?")))
+            continue
+        if _s1_norm(dv) in keys:
+            c.rep.add("T08", "error",
+                      f"對分群輸入變數「{dv}」跑了 ANOVA（物件 {a.get('id', '?')}）",
+                      "S1 循環推論：F 正是 K-Means 被最佳化的量，純隨機噪音一樣 p<0.001，"
+                      "這個 p 對「群是真的」提供零證據。分群輸入變數只做輪廓描述"
+                      "（群均值／群內 sd／群大小／index）。要「群分得開不開」的數字，"
+                      "唯一合法來源是 07 §7.4 的 structure_pvalue。"
+                      "獲利指標請改用 as_of 之後的期間（那不是分群輸入，跑 ANOVA 合法）",
+                      "模型輸出/analysis_objects.json")
+    if unparsed:
+        c.rep.add("T08", "warning",
+                  f"{len(unparsed)} 個 ANOVA 物件看不出因變數：{'、'.join(unparsed[:5])}",
+                  "在物件加「因變數」欄，或把 id 寫成 anova_<因變數>_by_<因子>。"
+                  "剖不出來 → 這幾個物件的 S1 沒驗到",
+                  "模型輸出/analysis_objects.json")
+
+    for v in obj.get("報了η²的變數", []) or obj.get("eta2_reported_vars", []):
+        if _s1_norm(v) in keys:
+            c.rep.add("T08", "error", f"對分群輸入變數「{v}」報了 η²",
+                      "η² = BGSS/TSS 與 F 是嚴格單調的一對一變換，"
+                      "n 與 k 在群大小表裡本來就有 —— 讀者一行算術就能還原 p。"
+                      "禁 F 的理由原封不動適用於 η²（07 §8.2）",
+                      "模型輸出/analysis_objects.json")
+
+    # (b) 交付層：直接掃實際要交出去的統計表。
+    #     只驗自我宣告的欄位，等於只擋「有誠實登錄的人」—— 沒登錄的照樣交出去。
+    for path in c.stat_tables():
+        header, rows = read_csv_rows(path)
+        if not header or not rows:
+            continue
+        hit_cols = [h for h in header
+                    if _s1_norm(h).lower().replace("_", "") in
+                    {x.replace(" ", "").replace("_", "") for x in _S1_INFERENCE_COLS}]
+        # 找出哪一欄在放變數名
+        var_idx = next((i for i, h in enumerate(header)
+                        if str(h).strip() in ("變數", "欄位", "指標", "項目", "variable")), 0)
+        offenders = {
+            str(r[var_idx]).strip() for r in rows
+            if len(r) > var_idx and _s1_norm(r[var_idx]) in keys
+        }
+        if not offenders:
+            continue
+        if hit_cols:
+            c.rep.add("T08", "error",
+                      f"交付統計表對分群輸入變數（{'、'.join(sorted(offenders))}）"
+                      f"輸出了推論欄位：{'、'.join(hit_cols)}",
+                      "07 §8.2：分群輸入變數的輸出物件裡不得有 p 值、η²、F、95% CI。"
+                      "把這幾欄拿掉只留輪廓描述，或改用非分群輸入的變數做檢定",
+                      path)
+        else:
+            blob = " ".join(header) + " " + " ".join(" ".join(map(str, r)) for r in rows[:3])
+            if _S1_PROFILE_NOTE not in blob:
+                c.rep.add("T08", "warning",
+                          f"表內含分群輸入變數（{'、'.join(sorted(offenders))}）"
+                          f"但沒有 07 §8.2 強制加註的說明",
+                          f"標題加註「（分群輸入變數，僅為輪廓描述；"
+                          f"分離度證據見 §7.4 的 structure_pvalue）」—— "
+                          f"沒有這句，讀者會把群間差異讀成統計結論",
+                          path)
+
+
+def chk_T09_s1_lineage_no_chi2_on_upstream(c: Ctx) -> None:
+    """S1 血緣：分群輸入的上游人口變數不准跑卡方（07 §8.2、§3.1）"""
+    obj = c.objects("T09")
+    if obj is None:
+        return
+    upstream = (obj.get("分群輸入上游變數")
+                or obj.get("分群先驗群變數")
+                or obj.get("cluster_input_upstream_vars") or [])
+    chi2_vars = (obj.get("卡方檢定變數") or obj.get("chi2_tested_vars") or [])
+    if not upstream:
+        inputs = obj.get("分群輸入變數") or []
+        if any(_s1_norm(v) == "CRI" for v in inputs):
+            c.rep.add("T09", "warning",
+                      "分群輸入含 CRI，但沒登錄先驗群用了哪些變數，血緣 gate 沒驗到",
+                      "CRI 的分母含先驗群的群內變數，先驗群變數等於分群輸入的上游。"
+                      "把它們寫進 analysis_objects.json 的「分群輸入上游變數」，"
+                      "否則拿同一批變數跑卡方會變成用被污染的分群檢定污染源",
+                      "模型輸出/analysis_objects.json")
+        return
+    up = {_s1_norm(v) for v in upstream}
+    for v in chi2_vars:
+        if _s1_norm(v) in up:
+            c.rep.add("T09", "error",
+                      f"對分群輸入的上游變數「{v}」跑了卡方檢定",
+                      "那等於用被污染的分群去檢定污染源：先驗群按這個變數分層 → "
+                      "CRI 帶著它的資訊進矩陣 → 群本來就會按它分開。"
+                      "改用沒有進入先驗群分層的變數，或把 CRI 移出分群輸入"
+                      "（07 §8.2 血緣比對、§3.1）",
+                      "模型輸出/analysis_objects.json")
+
+
 def chk_T03_pct_sum(c: Ctx) -> None:
     """百分比欄加總 ≈100（誤差 <0.5）（18-E9 同段、19 §5.4）"""
     for path in c.stat_tables():
@@ -1566,6 +1737,10 @@ CHECKS: list[Check] = [
     Check("T05", "統計", "|r|=1 的格子已標樣本不足", "18-E10", chk_T05_r_equals_one),
     Check("T06", "統計", "每張統計表最後一欄非空且非純數字", "18-E15", chk_T06_conclusion_col),
     Check("T07", "統計", "標 n.s. 的列有 mde 欄", "00 §四", chk_T07_ns_needs_mde),
+    Check("T08", "統計", "S1：分群輸入變數沒跑 ANOVA／沒報 η²／F／95% CI",
+          "07 §8.2", chk_T08_s1_no_anova_on_cluster_inputs),
+    Check("T09", "統計", "S1 血緣：分群輸入的上游人口變數沒跑卡方",
+          "07 §8.2、§3.1", chk_T09_s1_lineage_no_chi2_on_upstream),
 
     Check("C01", "符號", "交付檔中不存在空白格", "00 §四", chk_C01_blank_cells),
     Check("C02", "符號", "無 NaN / inf / #DIV/0! 洩漏", "18 §八、00 §四", chk_C02_leak_tokens),
