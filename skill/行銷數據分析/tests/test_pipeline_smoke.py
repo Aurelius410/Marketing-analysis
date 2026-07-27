@@ -922,3 +922,66 @@ def test_s1_gate_says_so_when_it_cannot_verify(root, clean_delivery):
         assert "S1 gate 這次沒有驗到" in r.all, f"假關卡：沒資料卻靜默通過\n{r}"
     finally:
         op.write_text(orig, encoding="utf-8")
+
+
+# ══════════════════════════════════════════════════════════════
+#  ⑪ cluster_validity —— k 的選擇（07 §五）與存在性（§7.4）
+# ══════════════════════════════════════════════════════════════
+def test_cluster_validity_selftest(root):
+    r = run("cluster_validity.py", "--self-test", root=root)
+    assert r.rc == 0, r
+
+
+def test_cluster_validity_on_real_matrix(root, r_prep):
+    """真資料上跑完四指標 + 仲裁 + 可執行性 + structure_pvalue。
+
+    B 調小只是為了測試速度；判準本身不隨 B 改變。
+    """
+    r = run("cluster_validity.py", PROJ, "--k-range", "2-6", "--B", "40",
+            "--no-spec-update", root=root)
+    assert r.rc in (0, 2), r
+    for section in ("四個指標", "Gap statistic", "silhouette 剖面",
+                    "仲裁", "可執行性檢驗", "structure_pvalue"):
+        assert section in r.all, f"少了「{section}」段\n{r}"
+    jp = root / PROJ / "模型輸出" / "cluster_validity.json"
+    d = json.loads(jp.read_text(encoding="utf-8"))
+    assert set(d["votes"]) == {"Elbow", "CH", "silhouette", "gap"}, d["votes"]
+    assert len(d["structure_pvalue"]) == 2, "07 §7.4 要求兩種參考分布都跑"
+    kinds = {x["參考類型"] for x in d["structure_pvalue"]}
+    assert kinds == {"permute", "uniform"}, kinds
+    # p 值有下界，不可能是 0（有限次重抽）
+    assert all(0 < x["structure_pvalue"] <= 1 for x in d["structure_pvalue"])
+
+
+def test_cluster_validity_executability_binds_on_30_when_n_small(root, r_prep):
+    """n < 600 時門檻恆由「最小群 ≥ 30 人」綁定，不是 5%。
+
+    07 §5.3：兩條取較嚴的（min_n >= max(0.05n, 30)），「n < 600 時恆由 (b)
+    綁定，不要只驗 (a)」。課程資料 n=89，5% 只給 4.45 人 —— 只驗 (a) 的話，
+    一個 5 人的群會被判通過，而那正是期末報告掉級的原因。
+    """
+    r = run("cluster_validity.py", PROJ, "--k-range", "2-6", "--B", "40",
+            "--no-spec-update", root=root)
+    assert "(b) 最小群人數 ≥ 30" in r.all, r
+    assert "n < 600 時恆由 (b) 綁定" in r.all, r
+
+
+def test_cluster_validity_reports_gap_reference_kind(root, r_prep):
+    """gap 的參考分布產生方式會改結果 → 必須記錄（07 §5.1）。
+
+    退出碼刻意不鎖 0/2：課程資料上換成 PCA 對齊的外框後，gap 的最佳 k 從 2
+    變成 1，觸發 §5.2 的「不要硬分」而回 1 —— 那是正確行為，正好證明這個
+    參數為什麼非記不可。這一條驗的是「有沒有記錄」，不是「結論是什麼」。
+    """
+    r = run("cluster_validity.py", PROJ, "--k-range", "2-5", "--B", "30",
+            "--gap-reference", "pca", "--no-spec-update", root=root)
+    assert r.rc in (0, 1, 2), r
+    assert "gap 參考分布=pca" in r.all, f"主控台沒標明用了哪種參考分布\n{r}"
+    d = json.loads((root / PROJ / "模型輸出" / "cluster_validity.json")
+                   .read_text(encoding="utf-8"))
+    assert d["gap"]["參考分布"] == "pca", d["gap"]
+
+
+def test_cluster_validity_rejects_bad_k_range(root):
+    r = run("cluster_validity.py", PROJ, "--k-range", "8-3", root=root)
+    assert r.rc == 64, f"k 範圍寫反應該是用法錯誤\n{r}"
