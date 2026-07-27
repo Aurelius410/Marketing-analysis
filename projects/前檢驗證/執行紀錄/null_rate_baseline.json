@@ -1,0 +1,13 @@
+{
+  "generated_at": "2026-07-27T23:19:42",
+  "null_rate": {
+    "transactions.交易序號": 0.0,
+    "transactions.信用卡ID": 0.0,
+    "transactions.客戶ID": 0.0,
+    "transactions.刷卡日期": 0.0,
+    "transactions.刷卡產品產業分類": 0.0,
+    "transactions.刷卡類型": 0.0,
+    "transactions.刷卡金額": 0.0,
+    "transactions.刷卡地點": 0.0
+  }
+}

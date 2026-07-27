@@ -1,0 +1,159 @@
+{
+  "meta": {
+    "project": "前檢驗證",
+    "as_of": "2012-12-01",
+    "tables": {
+      "transactions": 7764
+    },
+    "contract": "",
+    "rules_run": [
+      "Q1",
+      "Q2",
+      "Q3",
+      "Q4",
+      "Q5",
+      "Q6",
+      "Q7",
+      "Q8",
+      "Q9",
+      "Q10",
+      "Q11",
+      "Q12",
+      "Q13",
+      "Q14",
+      "Q15",
+      "Q16",
+      "Q17",
+      "Q18",
+      "Q19",
+      "Q20"
+    ],
+    "generated_at": "2026-07-27T23:19:42"
+  },
+  "findings": [
+    {
+      "rule": "Q6",
+      "name": "grain 不唯一",
+      "bucket": "warning",
+      "target": "transactions",
+      "n": 0,
+      "total": 0,
+      "detail": "未宣告 grain，無法驗證主鍵唯一性",
+      "action": "在契約寫 grain: {transactions: [欄名…]}，或用 --grain transactions=欄1,欄2",
+      "downstream": "所有彙總（sum/count 重複計算）→ M8 的 F/M、M11 的 ROAS、任何 join 後的分母",
+      "samples": [],
+      "note": "",
+      "source": "04 §4.1 Q6、§三"
+    },
+    {
+      "rule": "Q7",
+      "name": "NULL 率漂移",
+      "bucket": "info",
+      "target": "（全部欄位）",
+      "n": 8,
+      "total": 0,
+      "detail": "沒有前次載入的 NULL 率基準，本次無法比對",
+      "action": "已建立基準於 E:\\Projects\\行銷分析\\projects\\前檢驗證\\執行紀錄\\null_rate_baseline.json，下次載入才抓得到漂移",
+      "downstream": "所有以該欄為輸入的指標；典型是 ROAS 從 1.6 被算成 3.2",
+      "samples": [],
+      "note": "",
+      "source": "04 §4.1 Q7"
+    },
+    {
+      "rule": "Q11",
+      "name": "測試交易",
+      "bucket": "warning",
+      "target": "transactions.刷卡金額",
+      "n": 478,
+      "total": 7764,
+      "detail": "478 筆金額 ≤ 10 元，疑似測試交易或極小額",
+      "action": "逐筆判定；確認是測試就**移到 隔離區/ 不要直接刪**，並在報告交代排除筆數（18-E22）",
+      "downstream": "客單價、交易筆數、M11 的門市比較 —— 新店會得到「客單價 87 元」的假結論",
+      "samples": [
+        "2",
+        "10",
+        "6",
+        "7",
+        "5"
+      ],
+      "note": "",
+      "source": "04 §4.2 Q11"
+    },
+    {
+      "rule": "Q12",
+      "name": "bot 與內部流量",
+      "bucket": "info",
+      "target": "（無 user_agent 欄）",
+      "n": 0,
+      "total": 0,
+      "detail": "本批資料沒有 UA 欄，bot 檢查不適用",
+      "action": "若資料源是網站行為（D5），缺 UA 欄本身就要回頭問上游",
+      "downstream": "轉換率、M5 漏斗、A/B 檢定的分母 —— bot 從 8% 升到 14% 會偽造出「改版害轉換率下滑」",
+      "samples": [],
+      "note": "",
+      "source": "04 §4.2 Q12"
+    },
+    {
+      "rule": "Q13",
+      "name": "編碼序號缺口與命名破格",
+      "bucket": "warning",
+      "target": "transactions.刷卡產品產業分類",
+      "n": 2,
+      "total": 0,
+      "detail": "編碼前綴 [2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] 不連續，缺 [1, 4]",
+      "action": "確認缺的編碼是「本資料集沒有」還是「上游漏給」——後者會讓品類覆蓋率被高估",
+      "downstream": "用 split 解析編碼的所有品類分析（M8-2 購物籃、因素分析、品類角色）",
+      "samples": [],
+      "note": "",
+      "source": "04 §4.2 Q13"
+    },
+    {
+      "rule": "Q13",
+      "name": "編碼序號缺口與命名破格",
+      "bucket": "warning",
+      "target": "transactions.刷卡產品產業分類",
+      "n": 1,
+      "total": 0,
+      "detail": "1 個值不符主要命名慣例（NN_名稱）：X2.中信錢加值",
+      "action": "不要用 split('_') 解析編碼；改用 regexp_extract 並處理不匹配的情況",
+      "downstream": "用 split 解析編碼的所有品類分析（M8-2 購物籃、因素分析、品類角色）",
+      "samples": [
+        "X2.中信錢加值"
+      ],
+      "note": "",
+      "source": "04 §4.2 Q13"
+    },
+    {
+      "rule": "Q15",
+      "name": "樣本不足的實體",
+      "bucket": "warning",
+      "target": "transactions.客戶ID（依 刷卡日期）",
+      "n": 3,
+      "total": 100,
+      "detail": "3/100 個實體的去重事件日 < 3，算不出可用的間隔型指標",
+      "action": "算 CAI/WMLE/CRI 前先決定：補值、標記還是排除；覆蓋率要照 04 §七 兩層都報（≥3 天一層、間隔 ≥5 一層）",
+      "downstream": "CAI/WMLE/CRI 的覆蓋率與分群輸入資格（04 §七：<60% 不得當分群輸入）",
+      "samples": [
+        "18700",
+        "18841",
+        "6687"
+      ],
+      "note": "",
+      "source": "04 §4.2 Q15"
+    },
+    {
+      "rule": "Q16",
+      "name": "缺幣別欄",
+      "bucket": "warning",
+      "target": "transactions(刷卡金額)",
+      "n": 1,
+      "total": 0,
+      "detail": "有金額欄但沒有幣別欄，單位靠推定（未提供 --contract）",
+      "action": "在契約的 columns[].unit 明寫幣別（例：unit: TWD），逐表宣告時 table 要等於這裡的表名「transactions」；報告要寫 WARNING: currency column absent, unit inferred",
+      "downstream": "M 值的幣別、跨帳戶／跨市場彙總",
+      "samples": [],
+      "note": "",
+      "source": "04 §4.2 Q16"
+    }
+  ]
+}

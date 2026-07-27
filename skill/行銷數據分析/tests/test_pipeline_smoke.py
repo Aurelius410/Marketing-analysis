@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -761,3 +762,74 @@ def test_q16_respects_contract_declared_unit(root):
     assert r.rc == 0, f"契約已宣告幣別卻沒全綠\n{r}"
     assert "error 0、warning 0" in r.all, f"Q16 沒降到 info 桶\n{r}"
     assert "已解除" in r.all, f"Q16 沒標記為已解除\n{r}"
+
+
+# ══════════════════════════════════════════════════════════════
+#  ⑨ kmeans_preflight —— 五道關，前三道事前、後兩道事後
+# ══════════════════════════════════════════════════════════════
+def test_kmeans_preflight_selftest(root):
+    r = run("kmeans_preflight.py", "--self-test", root=root)
+    assert r.rc == 0, r
+
+
+def test_kmeans_preflight_pre_fit_does_not_claim_five_gates(root, r_prep):
+    """只跑得到三道關時，不准輸出「五道全過」。
+
+    07 §四：「前三道是事前可驗的，後兩道只能事後驗——這個區別要誠實寫在
+    報告裡，不要假裝五道都在跑之前就過了。」這是本腳本存在的理由，
+    真的退化成「跑三道印五道」的話，K-Means 對非球形簇給出的漂亮錯誤答案
+    就會一路進報告。
+    """
+    r = run("kmeans_preflight.py", PROJ, "--no-write", root=root)
+    assert r.rc in (0, 2), r
+    assert "跑了 3／5 道關" in r.all, f"沒有誠實標明跑了幾道\n{r}"
+    assert "報告不可寫「五道前提全部通過」" in r.all, r
+    assert "五道關全過" not in r.all, f"只跑三道卻宣稱五道全過\n{r}"
+
+
+def test_kmeans_preflight_gate1_reads_pre_standardization_sd(root, r_prep):
+    """關卡 1 必須還原標準化前的尺度比，不能對著標準化後的矩陣算。
+
+    cluster_matrix.parquet 每欄 sd 都是 1，直接算比值恆等於 1.00 —— 那是
+    一道穩過的假關卡。真值要從 scaler.json 的 vars[].scale 還原，而且必須
+    與 prep_cluster_matrix 自己報的數字對得上（兩支腳本各走各的路徑）。
+    """
+    r = run("kmeans_preflight.py", PROJ, "--no-write", root=root)
+    assert "標準化前尺度比" in r.all, f"關卡 1 沒去讀 scaler.json\n{r}"
+    m = re.search(r"標準化前尺度比 ([\d.]+)", r.all)
+    assert m, r
+    got = float(m.group(1))
+    m2 = re.search(r"標準化前尺度比 max\(sd\)/min\(sd\) = ([\d.]+)", r_prep.all)
+    assert m2, f"prep_cluster_matrix 沒報尺度比，對不了帳\n{r_prep}"
+    assert abs(got - float(m2.group(1))) < 0.05, (
+        f"兩支腳本算出的標準化前尺度比不一致："
+        f"kmeans_preflight={got}、prep_cluster_matrix={m2.group(1)}")
+
+
+def test_kmeans_preflight_no_scaler_refuses_to_pass_gate1(root, r_prep, tmp_path):
+    """已標準化但拿不到 scaler.json → 必須報 warning 並明講「沒有真的驗到」。"""
+    mtx = root / PROJ / "模型輸出" / "cluster_matrix.parquet"
+    if not mtx.exists():
+        pytest.skip("矩陣尚未產出")
+    r = run("kmeans_preflight.py", PROJ, "--matrix", str(mtx),
+            "--scaler", str(tmp_path / "不存在.json"), "--no-write", root=root)
+    assert r.rc == 2, r
+    assert "沒有真的驗到" in r.all, f"假關卡被當成通過\n{r}"
+
+
+def test_kmeans_preflight_post_fit_writes_json(root, r_prep):
+    """給了 --k 就要跑滿五道，並把結果寫成 JSON。
+
+    JSON 那一步是真的炸過：群標籤來自 pd.unique()，是 numpy int32，
+    json.dumps 丟 TypeError —— 而且是在五道關全跑完、CSV 都寫好之後才炸，
+    退出碼 70 蓋掉前面全綠的結論。
+    """
+    r = run("kmeans_preflight.py", PROJ, "--k", "4", root=root)
+    assert r.rc in (0, 2), r
+    assert "跑了 5／5 道關" in r.all, r
+    jp = root / PROJ / "模型輸出" / "kmeans_preflight.json"
+    assert jp.exists(), f"沒寫出 JSON\n{r}"
+    d = json.loads(jp.read_text(encoding="utf-8"))
+    assert d["gates_run"] == 5 and d["後兩道已驗"] is True, d
+    assert all(isinstance(x["群"], int) for x in d["gate4_detail"]), d["gate4_detail"]
+    assert "本節的 K-Means 有兩道前提只能事後檢查" in r.all, "沒印誠實說明模板"
