@@ -211,7 +211,7 @@ MAINLINE_SCRIPTS: dict[str, str] = {
     "check_schema_contract.py": "M1 步驟② 欄位契約比對",
     "pick_transform.py": "M3 轉換方法選用",
     "retransform.py": "M3 重新轉換",
-    "write_transform_log.py": "M3 transform_log 落地",
+    "write_transform_log.py": "M3 transform_log 實作",
     "prep_cluster_matrix.py": "M6 分群前必經前處理（07 §159）",
 }
 
