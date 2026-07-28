@@ -985,3 +985,55 @@ def test_cluster_validity_reports_gap_reference_kind(root, r_prep):
 def test_cluster_validity_rejects_bad_k_range(root):
     r = run("cluster_validity.py", PROJ, "--k-range", "8-3", root=root)
     assert r.rc == 64, f"k 範圍寫反應該是用法錯誤\n{r}"
+
+
+# ══════════════════════════════════════════════════════════════
+#  ⑫ check_fonts —— 產圖前的字型 gate（19 §3.3）
+# ══════════════════════════════════════════════════════════════
+def test_check_fonts_selftest(root):
+    r = run("check_fonts.py", "--self-test", root=root)
+    assert r.rc == 0, r
+
+
+def test_check_fonts_runs_and_reports_all_five_checks(root):
+    r = run("check_fonts.py", "--embed", root=root)
+    assert r.rc in (0, 1, 2), r
+    for sec in ("必要字型家族是否安裝", "字符涵蓋", "字重 instancing",
+                "數字是否等寬", "授權白名單"):
+        assert sec in r.all, f"少了「{sec}」段\n{r}"
+
+
+def test_check_fonts_measures_numerals_per_face(root):
+    """數字度量要逐 face 量，不能挑家族的第一個檔。
+
+    19 §3.2 舊版只寫「JhengHei 也等寬（0.5796 em）」—— 那對 Regular 成立、
+    對 Light 不成立（Light 有 4 種寬度）。而 font_manager 回傳同家族多個檔的
+    順序不保證，隨手取第一個有機會拿到 Light。
+    """
+    r = run("check_fonts.py", root=root)
+    if "Microsoft JhengHei" not in r.all:
+        pytest.skip("本機沒有微軟正黑體")
+    assert "Microsoft JhengHei Regular" in r.all, f"沒有逐 face 列出\n{r}"
+    assert "Microsoft JhengHei Bold" in r.all, f"沒有逐 face 列出\n{r}"
+
+
+def test_check_fonts_latin_only_family_is_not_an_error(root):
+    """Times New Roman 缺中文是設計本意（19 §3.1），不是缺陷。
+
+    中文微軟正黑體、英文 Times New Roman —— 對英數字型判「缺中文 = error」
+    會讓這道 gate 永遠紅燈，然後就沒有人會再看它了。
+    """
+    r = run("check_fonts.py", root=root)
+    if "Times New Roman" not in r.all:
+        pytest.skip("本機沒有 Times New Roman")
+    assert "判定為英數字型" in r.all, f"沒有辨識出英數字型\n{r}"
+    assert r.rc != 1, f"英數字型缺中文被誤判成 error\n{r}"
+
+
+def test_check_fonts_json_output(root, tmp_path):
+    out = tmp_path / "fonts.json"
+    r = run("check_fonts.py", "--json", str(out), root=root)
+    assert r.rc in (0, 1, 2), r
+    d = json.loads(out.read_text(encoding="utf-8"))
+    assert d["families"] and d["probe"], d
+    assert "coverage" in d and "numerals" in d, list(d)
