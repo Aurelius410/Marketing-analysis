@@ -1105,3 +1105,52 @@ def test_check_fonts_reads_tokens_as_single_source(root):
     r = run("check_fonts.py", root=root)
     assert "axes.unicode_minus" in r.all, (
         f"check_fonts 沒有讀 tokens.json 的 matplotlib必設\n{r}")
+
+
+# ══════════════════════════════════════════════════════════════
+#  ⑭ palette_lab —— 色盤驗證器（18-G14、19 §2.3）
+# ══════════════════════════════════════════════════════════════
+def test_palette_lab_selftest(root):
+    r = run("palette_lab.py", "--self-test", root=root)
+    assert r.rc == 0, r
+
+
+def test_palette_lab_validates_shipped_tokens(root):
+    """出貨的 tokens.json 必須自己驗得過（0 error）。
+
+    兩條 warning 是刻意的：紅綠語意色在綠色盲下 ΔE 不足，那不是要改色，
+    是要求極值上色一律配 +/− 或 ▲/▼。
+    """
+    r = run("palette_lab.py", "--validate", root=root)
+    assert r.rc in (0, 2), r
+    assert "error 0" in r.all, f"出貨色盤自己驗不過\n{r}"
+    assert "類別型・淺色・線條 全部過關" in r.all, r
+    assert "類別型・深色・線條 全部過關" in r.all, r
+
+
+def test_palette_lab_dark_threshold_is_relaxed_to_9(root):
+    """深色盤的 ΔE 門檻是 9 不是 12（04_design_system.md §1.4「放寬至 ≥9」）。
+
+    拿 12 去驗深色盤會得到假警報 —— 它的紅色盲 9.66、藍色盲 9.48 本來就過不了。
+    這個放寬原本只寫在研究稿裡，沒進出貨文件。
+    """
+    r = run("palette_lab.py", "--validate", root=root)
+    assert "本盤色差門檻 ΔE ≥ 9.0" in r.all, f"深色盤沒有用放寬後的門檻\n{r}"
+    assert "本盤色差門檻 ΔE ≥ 12.0" in r.all, f"淺色盤不該被放寬\n{r}"
+
+
+def test_palette_lab_contrast_matches_wcag_definition(root):
+    r = run("palette_lab.py", "--contrast", "#FFFFFF", "#000000", root=root)
+    assert r.rc == 0, r
+    assert "21.00" in r.all, f"白對黑必須恰好 21.00\n{r}"
+
+
+def test_palette_lab_rejects_bad_hex(root):
+    r = run("palette_lab.py", "--contrast", "not-a-color", "#FFF", root=root)
+    assert r.rc == 64, f"色值格式錯是命令列打錯，該回 64\n{r}"
+
+
+def test_palette_lab_warns_when_switching_colour_space(root):
+    """換色彩空間會讓門檻失去意義，必須出聲。"""
+    r = run("palette_lab.py", "--cvd-space", "linear", "--validate", root=root)
+    assert "不可沿用" in r.all, f"換空間沒有警告\n{r}"
