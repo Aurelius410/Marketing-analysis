@@ -61,11 +61,19 @@ description: |
 │   └── 20_交付物產製.md                ← 報告、儀表板、投影片、Excel
 │
 ├── scripts/                          ← 可重複使用的 Python 工具
-└── templates/                        ← 記憶檔、決策表、sizing、程式範本
-    └── sql/                          ← 建倉與指標 SQL 範本
+├── templates/                        ← 記憶檔、決策表、sizing、程式範本
+│   └── sql/                          ← 建倉與指標 SQL 範本
+├── assets/                           ← 設計 token（色、字、字級）
+│   ├── tokens.json                   ← **單一來源**，改色值前先跑 palette_lab.py
+│   └── marimo_theme.css              ← marimo 介面字型（只設官方保證的三個變數）
+└── tests/                            ← 迴歸測試
+    ├── test_pipeline_smoke.py        ← 串接冒煙（測介面，不測單支邏輯）
+    └── fixtures/                     ← 髒資料與乾淨交付的 fixture 產生器
 ```
 
-> **尚未建立的兩個目錄**：`assets/`（主題、調色盤、字型設定，需求見 18-G14、19 §3.3）與 `tests/`（對 17 §八 基準值的迴歸測試，需求見 00 §1.3、04 §九）目前**不在這個資料夾裡**。有 reference 引用到它們時，那是待建規格不是既有檔案 —— 別去找，會找不到。
+> `assets/tokens.json` 是圖表用色與字級的**單一來源**（18-G14、19 §2.2／§3.1）。裡面每一個對比值與 ΔE 都是實測數字，不是設計上的偏好 —— 要改色，先跑 `scripts/palette_lab.py` 重算，不要直接改 JSON 了事。
+>
+> `tests/` 的冒煙測試守的是**介面**（A 的產出 B 吃不吃得下），17 §八 的 19 條基準值迴歸也在裡面。跑法：`python -m pytest tests/test_pipeline_smoke.py -q`。
 
 ## 輸入素材與權威層級
 

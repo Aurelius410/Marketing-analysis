@@ -1,0 +1,19 @@
+/* assets/marimo_theme.css —— marimo 互動介面的字型設定（19 §3.3）
+ *
+ * 只設這三個變數。marimo 官方明示它們是 public API，其餘變數不保證跨版本穩定，
+ * 碰了就是在賭下一次升版。
+ *
+ * 掛載方式（擇一）：
+ *   marimo.App(css_file="assets/marimo_theme.css")
+ *   pyproject.toml  [tool.marimo.display]  custom_css = ["assets/marimo_theme.css"]
+ *
+ * 為什麼 Noto Sans TC 排在微軟正黑體前面：
+ *   marimo 介面的字型來自**收件人的機器**（與 HTML 互動圖同一條路徑，19 §3.3）。
+ *   收件人不一定是 Windows，微軟正黑體不一定在。Noto Sans TC 是 OFL，
+ *   對方自己裝得起來，也可以內嵌。正黑體排第二當本機的備援。
+ */
+:root {
+  --marimo-text-font:      "Noto Sans TC", "Microsoft JhengHei UI", "Microsoft JhengHei", sans-serif;
+  --marimo-heading-font:   "Noto Sans TC", "Microsoft JhengHei UI", "Microsoft JhengHei", sans-serif;
+  --marimo-monospace-font: "Cascadia Mono", "Consolas", monospace;
+}

@@ -1037,3 +1037,71 @@ def test_check_fonts_json_output(root, tmp_path):
     d = json.loads(out.read_text(encoding="utf-8"))
     assert d["families"] and d["probe"], d
     assert "coverage" in d and "numerals" in d, list(d)
+
+
+# ══════════════════════════════════════════════════════════════
+#  ⑬ assets/ —— 設計 token 的單一來源（18-G14、19 §2.2／§3.1）
+# ══════════════════════════════════════════════════════════════
+def test_tokens_json_is_valid_and_complete():
+    tok = json.loads((SKILL_ROOT / "assets" / "tokens.json").read_text(encoding="utf-8"))
+    for key in ("字型", "字級階梯", "類別型色盤", "順序型色盤",
+                "發散型色盤", "語意與中性", "驗證門檻", "matplotlib必設"):
+        assert key in tok, f"tokens.json 少了「{key}」"
+    # 使用者的硬要求：內文至少 12pt
+    body = next(x for x in tok["字級階梯"]["項目"] if x["用途"] == "報告內文")
+    assert body["pt"] >= 12, body
+    assert all(x["pt"] >= 9 for x in tok["字級階梯"]["項目"]), "有字級小於 9pt"
+    # 19 §3.1 末段：這一項不設，每個負值刻度都是豆腐字
+    assert tok["matplotlib必設"]["axes.unicode_minus"] is False
+
+
+def test_tokens_colors_are_wellformed_hex():
+    import re as _re
+    tok = json.loads((SKILL_ROOT / "assets" / "tokens.json").read_text(encoding="utf-8"))
+    hexpat = _re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+    def walk(node, path=""):
+        bad = []
+        if isinstance(node, str) and node.startswith("#"):
+            if not hexpat.match(node):
+                bad.append(f"{path}={node}")
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                bad += walk(v, f"{path}.{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                bad += walk(v, f"{path}[{i}]")
+        return bad
+
+    bad = walk(tok)
+    assert not bad, f"色值格式不對：{bad}"
+
+
+def test_tokens_light_categorical_contrast_meets_threshold():
+    """淺色類別盤前 5 槽的實測對比必須都過 WCAG 1.4.11 非文字門檻 3.0。
+
+    19 §2.2 明說 n=5 是全綠燈的最大槽數、n=6 起最低對比掉到 2.25。
+    這一條把那個結論固定住 —— 有人偷加第 6 個顏色進線條盤時會被擋。
+    """
+    tok = json.loads((SKILL_ROOT / "assets" / "tokens.json").read_text(encoding="utf-8"))
+    line_ok = tok["類別型色盤"]["淺色"]["線條可用"]
+    thr = tok["驗證門檻"]["MIN_CONTRAST_MARK"]
+    assert len(line_ok) == 5, f"淺色線條盤應為 5 槽，實際 {len(line_ok)}"
+    low = [c for c in line_ok if c["對比"] < thr]
+    assert not low, f"這些槽低於門檻 {thr}：{low}"
+
+
+def test_marimo_theme_sets_only_the_three_public_variables():
+    """marimo 官方只保證三個 CSS 變數穩定，多設就是在賭下次升版（19 §3.3）。"""
+    import re as _re
+    css = (SKILL_ROOT / "assets" / "marimo_theme.css").read_text(encoding="utf-8")
+    declared = set(_re.findall(r"(--marimo-[a-z-]+)\s*:", css))
+    assert declared == {"--marimo-text-font", "--marimo-heading-font",
+                        "--marimo-monospace-font"}, declared
+
+
+def test_check_fonts_reads_tokens_as_single_source(root):
+    """tokens.json 要真的被讀，不能只是宣稱它是單一來源。"""
+    r = run("check_fonts.py", root=root)
+    assert "axes.unicode_minus" in r.all, (
+        f"check_fonts 沒有讀 tokens.json 的 matplotlib必設\n{r}")

@@ -53,7 +53,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from paths import cfg  # noqa: E402
+from paths import SKILL_ROOT, cfg  # noqa: E402
 from exitcodes import (  # noqa: E402
     EX_OK, EX_ERROR, EX_WARN, EX_SOFTWARE, GateArgumentParser,
 )
@@ -424,16 +424,52 @@ def check_embed_license(families: list[str]) -> list[dict[str, Any]]:
 
 
 # ══════════════════════════════════════════════════════════════
+def load_tokens() -> dict[str, Any] | None:
+    """讀 assets/tokens.json —— 圖表用色與字型的單一來源（18-G14）。"""
+    import json
+    p = SKILL_ROOT / "assets" / "tokens.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def run(args: Any) -> int:
     families = list(REQUIRED_FAMILIES)
     for f in args.family or []:
         if f not in families:
             families.append(f)
-    # config.yml 指定的字型也一併驗 —— 那才是產圖時真的會用到的
-    for key in ("字型.中文", "字型.英文", "字型.對外散布備援"):
-        v = cfg(key)
-        if v and v not in families:
-            families.append(str(v))
+
+    # assets/tokens.json 是字型的單一來源；paths 的 cfg() 是機器層覆寫。
+    # 兩邊不一致 = 產圖時到底用哪個字型沒有人說得準 —— 那正是這道 gate 該擋的事。
+    tok = load_tokens()
+    tok_fonts = (tok or {}).get("字型", {})
+    for key, tk in (("字型.中文", "中文"), ("字型.英文", "英文"),
+                    ("字型.對外散布備援", "對外散布備援")):
+        v_cfg, v_tok = cfg(key), tok_fonts.get(tk)
+        for v in (v_cfg, v_tok):
+            if v and str(v) not in families:
+                families.append(str(v))
+        if v_cfg and v_tok and str(v_cfg) != str(v_tok):
+            warn(f"{tk}字型兩處不一致：config 說「{v_cfg}」、"
+                 f"assets/tokens.json 說「{v_tok}」",
+                 "tokens.json 是單一來源（18-G14）。要覆寫就只留 config.yml 一處，"
+                 "並同步改 tokens.json —— 兩處分岔的話，圖用哪個字型取決於哪支"
+                 "腳本產的，同一份報告會混字型")
+
+    # tokens.json 明訂 axes.unicode_minus 必須關掉（19 §3.1 末段）。
+    # 這件事非驗不可：中文字型多半沒有 U+2212，不關掉的話每個負值刻度都是 □。
+    if tok:
+        want = tok.get("matplotlib必設", {}).get("axes.unicode_minus")
+        if want is False:
+            import matplotlib
+            cur = matplotlib.rcParams.get("axes.unicode_minus", True)
+            if cur:
+                detail("提醒：matplotlib 的 axes.unicode_minus 目前是 True（預設值）。"
+                       "產圖腳本必須設成 False —— 否則負號用 U+2212，"
+                       "而多數中文字型缺這個字符（19 §3.1）。")
 
     probe = args.probe or PROBE_TEXT
 
